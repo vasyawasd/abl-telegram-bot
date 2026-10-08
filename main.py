@@ -154,8 +154,28 @@ def auto_monitor_loop():
             pass
         time.sleep(CHECK_INTERVAL_SEC)
 
+import http.server
+import socketserver
+
+def start_render_web_server():
+    """Фоновый HTTP-сервер для бесплатного тарифа Render Web Service."""
+    port = int(os.getenv("PORT", "10000"))
+    class QuietHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is alive!")
+        def log_message(self, format, *args):
+            return
+    try:
+        server = socketserver.TCPServer(("", port), QuietHandler)
+        server.serve_forever()
+    except Exception:
+        pass
+
 def run_bot():
     print("Бот запущен в публичном мультикомандном режиме...")
+    threading.Thread(target=start_render_web_server, daemon=True).start()
     threading.Thread(target=auto_monitor_loop, daemon=True).start()
 
     offset = 0
