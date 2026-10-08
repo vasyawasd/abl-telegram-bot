@@ -95,12 +95,38 @@ def fetch_next_game(team_name: str, division_name: str = ""):
     )
     return g["id"], text
 
-def send_msg(chat_id: int | str, text: str):
-    requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
-        timeout=10
-    )
+def send_msg(chat_id: int | str, text: str) -> int | None:
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=10
+        ).json()
+        if r.get("ok"):
+            return r["result"]["message_id"]
+    except Exception:
+        pass
+    return None
+
+def delete_msg(chat_id: int | str, message_id: int):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/deleteMessage",
+            json={"chat_id": chat_id, "message_id": message_id},
+            timeout=5
+        )
+    except Exception:
+        pass
+
+def delete_later(chat_id: int | str, message_ids: list, delay: float = 1.5):
+    """Удаляет список сообщений через delay секунд (в фоне, чтобы не блокировать бота)."""
+    def _worker():
+        time.sleep(delay)
+        for mid in message_ids:
+            if mid:
+                delete_msg(chat_id, mid)
+    threading.Thread(target=_worker, daemon=True).start()
+
 
 def auto_monitor_loop():
     """Фоновый мониторинг: проверяет новые игры индивидуально для каждого чата."""
@@ -180,7 +206,8 @@ def run_bot():
                 if cmd.startswith(("/set", "/team")):
                     # Если команда в группе, проверяем права админа этой группы
                     if not is_private and not is_group_admin(chat_id, user_id):
-                        send_msg(chat_id, "⛔️ Только администратор этой группы может настраивать или менять команду.")
+                        w_id = send_msg(chat_id, "⛔️ Только администратор этой группы может настраивать или менять команду.")
+                        delete_later(chat_id, [w_id, msg.get("message_id")], delay=1.5)
                         continue
 
                     prefix = "/team" if cmd.startswith("/team") else "/set"
@@ -213,7 +240,8 @@ def run_bot():
                 # --- 2.1 СБРОС / ОТВЯЗКА КОМАНДЫ (ТОЛЬКО ДЛЯ АДМИНИСТРАТОРОВ) ---
                 if cmd in ["/unset", "/reset"]:
                     if not is_private and not is_group_admin(chat_id, user_id):
-                        send_msg(chat_id, "⛔️ Только администратор этой группы может отвязать команду.")
+                        w_id = send_msg(chat_id, "⛔️ Только администратор этой группы может отвязать команду.")
+                        delete_later(chat_id, [w_id, msg.get("message_id")], delay=1.5)
                         continue
 
                     if chat_id in cfg:
