@@ -210,6 +210,21 @@ def run_bot():
                     ))
                     continue
 
+                # --- 2.1 СБРОС / ОТВЯЗКА КОМАНДЫ (ТОЛЬКО ДЛЯ АДМИНИСТРАТОРОВ) ---
+                if cmd in ["/unset", "/reset"]:
+                    if not is_private and not is_group_admin(chat_id, user_id):
+                        send_msg(chat_id, "⛔️ Только администратор этой группы может отвязать команду.")
+                        continue
+
+                    if chat_id in cfg:
+                        old_team = cfg[chat_id].get("team", "")
+                        del cfg[chat_id]
+                        save_chats_config(cfg)
+                        send_msg(chat_id, f"🗑 Привязка к команде *{old_team}* удалена.\nБот больше не отслеживает игры для этого чата.")
+                    else:
+                        send_msg(chat_id, "ℹ️ К этому чату не привязана ни одна команда.")
+                    continue
+
                 # --- 3. ЗАПРОС РАСПИСАНИЯ ИГРОКАМИ (ДОСТУПНО ВСЕМ) ---
                 if any(c in cmd for c in ["/game", "/next", "игра", "форма"]):
                     if chat_id in cfg and cfg[chat_id].get("team"):
