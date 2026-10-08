@@ -69,7 +69,7 @@ def fetch_next_game(team_name: str, division_name: str = ""):
     place = f"{court} ({loc})" if court and court != loc else (court or loc or "Уточняется")
 
     # Слева = светлая, справа = черная
-    form = "⚪️ СВЕТЛАЯ (играем слева)" if is_left else "⚫️ ЧЁРНАЯ (играем справа)"
+    form = "⚪️ СВЕТЛАЯ" if is_left else "⚫️ ЧЁРНАЯ"
 
     text = (
         f"🏀 *Расписание игры{tour_str}*\n\n"
