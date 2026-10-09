@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 TOKEN = os.getenv("BOT_TOKEN", "8905956001:AAGm2I5butxOQeO9LjFMn_4yH99eEkPdIBg")
 LEAGUE_ID = int(os.getenv("LEAGUE_ID", "2"))
+DEFAULT_TEAM = os.getenv("DEFAULT_TEAM", "БК Путилково")
 CHECK_INTERVAL_SEC = 600
 CHATS_FILE = "chats.json"
 
@@ -104,6 +105,14 @@ def send_msg(chat_id: int | str, text: str) -> int | None:
         ).json()
         if r.get("ok"):
             return r["result"]["message_id"]
+        # Резерв без Markdown, если в тексте были спецсимволы
+        r2 = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10
+        ).json()
+        if r2.get("ok"):
+            return r2["result"]["message_id"]
     except Exception:
         pass
     return None
@@ -206,12 +215,13 @@ def run_bot():
                     if is_private:
                         send_msg(chat_id, (
                             "👋 Привет! Я бот для мониторинга расписания лиги ABL.\n\n"
-                            "🏀 *Как подключить к вашей команде:*\n"
-                            "1. Добавьте меня в чат вашей команды.\n"
-                            "2. Администратор чата должен отправить команду настройки:\n"
-                            "`/set Название Команды`\n"
-                            "*(или с дивизионом: `/set Название | Дивизион`)*\n\n"
-                            "После этого я буду автоматически присылать расписание и цвет формы в чат!"
+                            f"🏀 По умолчанию настроен на команду: *{DEFAULT_TEAM}*\n\n"
+                            "• Нажмите `/game` — узнать ближайшую игру, зал и цвет формы.\n"
+                            "• `/game НазваниеКоманды` — проверить любую команду лиги.\n"
+                            "• `/set НазваниеКоманды` — привязать другую команду к этому диалогу.\n\n"
+                            "👥 *Для добавления в группу:*\n"
+                            "Добавьте бота в чат команды. Администратор может отправить `/set Название Команды`, "
+                            "и бот будет автоматически оповещать всех о новых матчах!"
                         ))
                     else:
                         if chat_id in cfg and cfg[chat_id].get("team"):
@@ -219,7 +229,12 @@ def run_bot():
                             div_s = f" ({info['division']})" if info.get('division') else ""
                             send_msg(chat_id, f"🏀 Этот чат настроен на команду: *{info['team']}*{div_s}.\nИспользуйте команду `/game` для просмотра ближайшей игры.")
                         else:
-                            send_msg(chat_id, "👋 Привет! Чтобы настроить бота, администратор чата должен отправить:\n`/set Название Команды | Дивизион`")
+                            send_msg(chat_id, (
+                                f"👋 Привет! В этой группе пока не настроена отдельная команда.\n"
+                                f"• Напишите `/game` — покажет ближайшую игру команды *{DEFAULT_TEAM}*.\n"
+                                f"• Чтобы закрепить за группой вашу команду, администратор должен отправить:\n"
+                                f"`/set Название Команды`"
+                            ))
                     continue
 
                 # --- 2. НАСТРОЙКА КОМАНДЫ ДЛЯ ЧАТА (ТОЛЬКО ДЛЯ АДМИНИСТРАТОРОВ) ---
@@ -274,15 +289,31 @@ def run_bot():
                     continue
 
                 # --- 3. ЗАПРОС РАСПИСАНИЯ ИГРОКАМИ (ДОСТУПНО ВСЕМ) ---
-                if any(c in cmd for c in ["/game", "/next", "игра", "форма"]):
-                    if chat_id in cfg and cfg[chat_id].get("team"):
-                        info = cfg[chat_id]
-                        _, reply = fetch_next_game(info["team"], info.get("division", ""))
-                        send_msg(chat_id, reply)
-                    elif is_private:
-                        send_msg(chat_id, "В личных сообщениях укажите команду:\n`/game НазваниеКоманды`")
+                is_game_cmd = False
+                team_query = ""
+                division_query = ""
+
+                if cmd.startswith(("/game", "/next")):
+                    is_game_cmd = True
+                    prefix = "/next" if cmd.startswith("/next") else "/game"
+                    team_query = raw_text[len(prefix):].strip()
+                elif any(c in cmd for c in ["игра", "форма"]):
+                    is_game_cmd = True
+
+                if is_game_cmd:
+                    if team_query:
+                        if "|" in team_query:
+                            team_query, division_query = [x.strip() for x in team_query.split("|", 1)]
+                    elif chat_id in cfg and cfg[chat_id].get("team"):
+                        team_query = cfg[chat_id]["team"]
+                        division_query = cfg[chat_id].get("division", "")
                     else:
-                        send_msg(chat_id, "⚠️ Бот еще не настроен для этой группы. Администратор должен отправить:\n`/set Название Команды`")
+                        team_query = DEFAULT_TEAM
+                        division_query = ""
+
+                    _, reply = fetch_next_game(team_query, division_query)
+                    send_msg(chat_id, reply)
+                    continue
 
         except Exception:
             time.sleep(3)
