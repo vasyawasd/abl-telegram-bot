@@ -293,9 +293,9 @@ def run_bot():
                 team_query = ""
                 division_query = ""
 
-                if cmd.startswith(("/game", "/next")):
+                if cmd.startswith(("/game", "/next", "/abl")):
                     is_game_cmd = True
-                    prefix = "/next" if cmd.startswith("/next") else "/game"
+                    prefix = "/abl" if cmd.startswith("/abl") else ("/next" if cmd.startswith("/next") else "/game")
                     team_query = raw_text[len(prefix):].strip()
                 elif any(c in cmd for c in ["игра", "форма"]):
                     is_game_cmd = True
