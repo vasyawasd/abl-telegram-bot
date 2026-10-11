@@ -203,7 +203,10 @@ def start_render_web_server():
         pass
 
 def run_bot():
-    print("Бот запущен в публичном мультикомандном режиме...")
+    if not TOKEN:
+        print("❌ ОШИБКА: Токен бота не найден! Проверьте файл .env")
+        return
+    print(f"Бот запущен (токен: {TOKEN[:10]}***, длина {len(TOKEN)} симв.)...")
     threading.Thread(target=start_render_web_server, daemon=True).start()
     threading.Thread(target=auto_monitor_loop, daemon=True).start()
 
@@ -348,7 +351,8 @@ def run_bot():
                     send_msg(chat_id, reply)
                     continue
 
-        except Exception:
+        except Exception as e:
+            print(f"❌ Ошибка в цикле: {e}")
             time.sleep(3)
 
 if __name__ == "__main__":
