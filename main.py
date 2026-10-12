@@ -147,15 +147,17 @@ def send_msg(chat_id: int | str, text: str) -> int | None:
 
 def delete_msg(chat_id: int | str, message_id: int):
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/deleteMessage",
-            json={"chat_id": chat_id, "message_id": message_id},
+            json={"chat_id": chat_id, "message_id": int(message_id)},
             timeout=5
-        )
-    except Exception:
-        pass
+        ).json()
+        if not r.get("ok"):
+            print(f"⚠️ Ошибка удаления {message_id}: {r.get('description')}")
+    except Exception as e:
+        print(f"⚠️ Сбой сети при удалении {message_id}: {e}")
 
-def delete_later(chat_id: int | str, message_ids: list, delay: float = 2.5):
+def delete_later(chat_id: int | str, message_ids: list, delay: float = 3.0):
     """Удаляет список сообщений через delay секунд (в фоне, чтобы не блокировать бота)."""
     def _worker():
         time.sleep(delay)
@@ -168,6 +170,8 @@ def delete_later(chat_id: int | str, message_ids: list, delay: float = 2.5):
                     pass
         if not valid_ids:
             return
+
+        valid_ids = sorted(list(set(valid_ids)))
 
         # 1. Пробуем удалить всё разом через deleteMessages (Bot API 7.0+)
         try:
@@ -183,15 +187,8 @@ def delete_later(chat_id: int | str, message_ids: list, delay: float = 2.5):
 
         # 2. Поштучное удаление с небольшой паузой
         for mid in valid_ids:
-            try:
-                requests.post(
-                    f"https://api.telegram.org/bot{TOKEN}/deleteMessage",
-                    json={"chat_id": chat_id, "message_id": mid},
-                    timeout=5
-                )
-                time.sleep(0.2)
-            except Exception:
-                pass
+            delete_msg(chat_id, mid)
+            time.sleep(0.3)
     threading.Thread(target=_worker, daemon=True).start()
 
 
@@ -275,16 +272,17 @@ def run_bot():
                 if not msg or "text" not in msg:
                     continue
 
+                raw_text = msg["text"].strip()
+
+                # Игнорируем любые обычные сообщения в чате — реагируем СТРОГО на слэш-команды
+                if not raw_text.startswith("/"):
+                    continue
+
                 chat_id = str(msg["chat"]["id"])
                 user_id = msg.get("from", {}).get("id", 0)
                 is_private = msg.get("chat", {}).get("type") == "private"
-                raw_text = msg["text"].strip()
                 cmd = raw_text.split("@")[0].lower()
-                clean_text = raw_text.strip().lower().rstrip("?!.,; ")
-
-                # Логируем только команды бота, чтобы не спамить в терминал обычной перепиской
-                if raw_text.startswith("/") or clean_text in ["игра", "форма", "когда игра", "какая форма", "расписание"]:
-                    print(f"🤖 [{chat_id}] {raw_text}")
+                print(f"🤖 [{chat_id}] {raw_text}")
 
                 cfg = load_chats_config()
 
@@ -367,18 +365,11 @@ def run_bot():
                     continue
 
                 # --- 3. ЗАПРОС РАСПИСАНИЯ ИГРОКАМИ (ДОСТУПНО ВСЕМ) ---
-                is_game_cmd = False
-                team_query = ""
-                division_query = ""
-
                 if cmd.startswith(("/game", "/next", "/abl")):
-                    is_game_cmd = True
                     prefix = "/abl" if cmd.startswith("/abl") else ("/next" if cmd.startswith("/next") else "/game")
                     team_query = raw_text[len(prefix):].strip()
-                elif clean_text in ["игра", "форма", "когда игра", "какая форма", "расписание"]:
-                    is_game_cmd = True
+                    division_query = ""
 
-                if is_game_cmd:
                     if team_query:
                         if "|" in team_query:
                             team_query, division_query = [x.strip() for x in team_query.split("|", 1)]
