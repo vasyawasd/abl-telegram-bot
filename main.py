@@ -172,18 +172,88 @@ DEFAULT_TEAM = (os.getenv("DEFAULT_TEAM") or os.getenv("TEAM_NAME") or "БК П�
 CHECK_INTERVAL_SEC = 600
 CHATS_FILE = "chats.json"
 
+CONFIG_LOCK = threading.RLock()
+
 def load_chats_config() -> dict:
-    if os.path.exists(CHATS_FILE):
-        try:
-            with open(CHATS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    with CONFIG_LOCK:
+        if os.path.exists(CHATS_FILE):
+            try:
+                with open(CHATS_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                safe_print(f"⚠️ Ошибка чтения {CHATS_FILE}: {e}")
+                bak = CHATS_FILE + ".bak"
+                if os.path.exists(bak):
+                    try:
+                        with open(bak, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                            safe_print(f"✅ Конфигурация восстановлена из {bak}")
+                            return data
+                    except Exception as e_bak:
+                        safe_print(f"❌ Ошибка резервной копии {bak}: {e_bak}")
+                return {}
+        bak = CHATS_FILE + ".bak"
+        if os.path.exists(bak):
+            try:
+                with open(bak, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
 
 def save_chats_config(data: dict):
-    with open(CHATS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    with CONFIG_LOCK:
+        tmp_path = CHATS_FILE + ".tmp"
+        bak_path = CHATS_FILE + ".bak"
+        try:
+            # 1. Запись во временный файл со сбросом буфера на диск (fsync)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+
+            # 2. Резервная копия перед заменой
+            if os.path.exists(CHATS_FILE):
+                try:
+                    with open(CHATS_FILE, "r", encoding="utf-8") as src, open(bak_path, "w", encoding="utf-8") as dst:
+                        dst.write(src.read())
+                        dst.flush()
+                        try:
+                            os.fsync(dst.fileno())
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # 3. Атомарная замена файла
+            os.replace(tmp_path, CHATS_FILE)
+
+            # 4. Fsync директории на POSIX системах (Termux/Linux)
+            if hasattr(os, "O_DIRECTORY") and hasattr(os, "open") and os.name != "nt":
+                try:
+                    dir_path = os.path.dirname(os.path.abspath(CHATS_FILE)) or "."
+                    dir_fd = os.open(dir_path, os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except Exception:
+                    pass
+        except Exception as e:
+            safe_print(f"⚠️ Ошибка атомарного сохранения {CHATS_FILE}: {e}")
+
+def disable_chat(chat_id: int | str, reason: str = ""):
+    """Безопасно отключает рассылку в чат, если бота удалили или чат деактивирован."""
+    with CONFIG_LOCK:
+        cfg = load_chats_config()
+        s_id = str(chat_id)
+        if s_id in cfg and cfg[s_id].get("enabled", True):
+            cfg[s_id]["enabled"] = False
+            save_chats_config(cfg)
+            safe_print(f"ℹ️ Чат {chat_id} отключен от рассылки ({reason})")
 
 def is_group_admin(chat_id: str | int, user_id: int) -> bool:
     """Проверяет права пользователя в конкретной группе Telegram."""
@@ -200,6 +270,62 @@ def is_group_admin(chat_id: str | int, user_id: int) -> bool:
         pass
     return False
 
+# Кэш расписания ABL (Circuit Breaker / Network resilience)
+ABL_GAMES_CACHE = []
+ABL_GAMES_CACHE_TIME = 0.0
+
+def fetch_raw_abl_games(fallback_to_cache: bool = False) -> list | None:
+    global ABL_GAMES_CACHE, ABL_GAMES_CACHE_TIME
+    url = f"https://mtgame.ru/api/v1/league/{LEAGUE_ID}/games/"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        resp = r.json()
+        if isinstance(resp, list):
+            ABL_GAMES_CACHE = resp
+            ABL_GAMES_CACHE_TIME = time.time()
+            return resp
+    except Exception as e:
+        safe_print(f"⚠️ Сбой при запросе к ABL API: {e}")
+
+    # Фолбэк на кэш при сетевом сбое лиги (для фонового мониторинга)
+    if fallback_to_cache and ABL_GAMES_CACHE:
+        safe_print("ℹ️ Использован кэш ABL API при сбое сети")
+        return ABL_GAMES_CACHE
+    return None
+
+def format_game_card(g: dict, is_left: bool, title: str = "Расписание игры") -> str:
+    """Форматирует карточку игры с залом, формой и московским временем."""
+    t1 = (g.get("team") or {}).get("name") or ""
+    t2 = (g.get("competitor_team") or {}).get("name") or ""
+    tour = g.get("tournament_tour")
+    tour_str = f" ({tour} тур)" if tour else ""
+    division = (g.get("tournament") or {}).get("name") or "ABL"
+    court = (g.get("tournament_court") or {}).get("name") or ""
+    loc = g.get("location") or ""
+    place = f"{court} ({loc})" if court and court != loc else (court or loc or "Уточняется")
+    form = "⚪️ СВЕТЛАЯ" if is_left else "⚫️ ЧЁРНАЯ"
+
+    dt_str = g.get("datetime")
+    msk_str = "Уточняется"
+    if dt_str:
+        try:
+            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            msk_str = dt.astimezone(MOSCOW_TZ).strftime('%d.%m.%Y в %H:%M')
+        except Exception:
+            pass
+
+    return (
+        f"🏀 *{title}{tour_str}*\n\n"
+        f"⚔️ *Матч:* {t1} — {t2}\n"
+        f"🏆 *Дивизион:* {division}\n"
+        f"📅 *Когда:* {msk_str} (МСК)\n"
+        f"📍 *Зал:* {place}\n"
+        f"👕 *Форма:* {form}"
+    )
+
 def fetch_next_game(team_name: str, division_name: str = ""):
     parsed_team, parsed_div = parse_team_and_division(team_name)
     team_name = parsed_team or team_name
@@ -208,17 +334,9 @@ def fetch_next_game(team_name: str, division_name: str = ""):
     if not team_name:
         return None, "⚠️ Пожалуйста, укажите название команды: `/game НазваниеКоманды`"
 
-    url = f"https://mtgame.ru/api/v1/league/{LEAGUE_ID}/games/"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"}
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        resp = r.json()
-    except Exception as e:
-        safe_print(f"⚠️ Сбой при запросе к ABL API: {e}")
+    resp = fetch_raw_abl_games(fallback_to_cache=False)
+    if resp is None:
         return None, "⚠️ Не удалось получить данные о расписании ABL (ошибка сети/сервера). Попробуйте позже."
-
-    if not isinstance(resp, list):
-        return None, "⚠️ Не удалось получить данные о расписании ABL. Попробуйте позже."
 
     now = datetime.now(timezone.utc)
     upcoming = []
@@ -284,17 +402,9 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
     if not team_name:
         return "⚠️ Пожалуйста, укажите название команды: `/schedule НазваниеКоманды`"
 
-    url = f"https://mtgame.ru/api/v1/league/{LEAGUE_ID}/games/"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"}
-    try:
-        r = requests.get(url, headers=headers, timeout=10)
-        resp = r.json()
-    except Exception as e:
-        safe_print(f"⚠️ Сбой при запросе к ABL API: {e}")
+    resp = fetch_raw_abl_games(fallback_to_cache=False)
+    if resp is None:
         return "⚠️ Не удалось получить данные о расписании ABL (ошибка сети/сервера). Попробуйте позже."
-
-    if not isinstance(resp, list):
-        return "⚠️ Не удалось получить данные о расписании ABL. Попробуйте позже."
 
     now = datetime.now(timezone.utc)
     min_dt = datetime.min.replace(tzinfo=timezone.utc)
@@ -357,19 +467,37 @@ def send_msg(chat_id: int | str, text: str) -> int | None:
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
             timeout=10
-        ).json()
-        if r.get("ok"):
-            return r["result"]["message_id"]
-        # Резерв без Markdown, если в тексте были спецсимволы
+        )
+        if r.status_code == 429:
+            try:
+                retry_after = int(r.json().get("parameters", {}).get("retry_after", 5))
+            except Exception:
+                retry_after = 5
+            safe_print(f"⚠️ Telegram 429 в send_msg. Ожидание {retry_after + 1} сек...")
+            time.sleep(retry_after + 1.0)
+            return send_msg(chat_id, text)
+
+        res = r.json()
+        if res.get("ok"):
+            return res["result"]["message_id"]
+
+        err_code = res.get("error_code")
+        err_desc = (res.get("description") or "").lower()
+        if err_code == 403 or "kicked" in err_desc or "deactivated" in err_desc or "chat not found" in err_desc:
+            disable_chat(chat_id, err_desc)
+            return None
+
+        # Резерв без Markdown, если в тексте были спецсимволы разметки
         r2 = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text},
             timeout=10
-        ).json()
-        if r2.get("ok"):
-            return r2["result"]["message_id"]
-    except Exception:
-        pass
+        )
+        res2 = r2.json()
+        if res2.get("ok"):
+            return res2["result"]["message_id"]
+    except Exception as e:
+        safe_print(f"⚠️ Сбой сети при отправке в чат {chat_id}: {e}")
     return None
 
 def delete_msg(chat_id: int | str, message_id: int):
@@ -422,31 +550,97 @@ def delete_later(chat_id: int | str, message_ids: list, delay: float = 3.0):
 
 
 def auto_monitor_loop():
-    """Фоновый мониторинг: проверяет новые игры индивидуально для каждого чата."""
+    """Фоновый мониторинг:
+    1. Оповещает о появлении нового расписания матча.
+    2. Надежный отложенный механизм напоминаний: за 24 часа и за 3 часа до игры."""
     time.sleep(5)
     while True:
         try:
             cfg = load_chats_config()
+            now_utc = datetime.now(timezone.utc)
             changed = False
+            raw_games = fetch_raw_abl_games(fallback_to_cache=True) or []
+
             for s_chat_id, info in cfg.items():
-                if not isinstance(info, dict):
+                if not isinstance(info, dict) or info.get("enabled") is False:
                     continue
                 team = info.get("team")
                 if not team:
                     continue
                 division = info.get("division", "")
-                last_id = info.get("last_game_id")
+                reminded_stages = info.setdefault("reminded_stages", [])
 
-                game_id, text = fetch_next_game(team, division)
-                if game_id and game_id != last_id:
-                    send_msg(s_chat_id, f"⚡️ *Новое расписание матча!*\n\n{text}")
-                    info["last_game_id"] = game_id
-                    changed = True
+                upcoming = []
+                for g in raw_games:
+                    if not isinstance(g, dict) or g.get("status") != "open":
+                        continue
+                    t1 = (g.get("team") or {}).get("name") or ""
+                    t2 = (g.get("competitor_team") or {}).get("name") or ""
+                    tourn = (g.get("tournament") or {}).get("name") or ""
+                    is_left = match_text(team, t1)
+                    is_right = match_text(team, t2)
+                    div_match = not division or match_text(division, tourn)
+
+                    if (is_left or is_right) and div_match:
+                        dt_str = g.get("datetime")
+                        if dt_str:
+                            try:
+                                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=timezone.utc)
+                                if dt >= now_utc:
+                                    upcoming.append((dt, g, is_left, t1, t2))
+                            except Exception:
+                                pass
+
+                if not upcoming:
+                    continue
+
+                upcoming.sort(key=lambda x: x[0])
+
+                # 1. Анонс нового назначенного матча
+                dt_nearest, g_nearest, is_left_nearest, _, _ = upcoming[0]
+                gid_nearest = g_nearest.get("id")
+                last_id = info.get("last_game_id")
+                ann_key = f"{gid_nearest}:announced"
+
+                if gid_nearest and (gid_nearest != last_id) and (ann_key not in reminded_stages):
+                    card_text = format_game_card(g_nearest, is_left_nearest, "Новое расписание матча!")
+                    mid = send_msg(s_chat_id, f"⚡️ *Новое расписание матча!*\n\n{card_text}")
+                    if mid:
+                        info["last_game_id"] = gid_nearest
+                        reminded_stages.append(ann_key)
+                        changed = True
+
+                # 2. Двухуровневый отложенный механизм напоминаний
+                for dt, g, is_left, _, _ in upcoming:
+                    gid = g.get("id")
+                    if not gid:
+                        continue
+                    hours_to_game = (dt - now_utc).total_seconds() / 3600.0
+
+                    # За 24 часа до игры (окно 18..30 часов)
+                    stage_24h = f"{gid}:24h"
+                    if 18.0 <= hours_to_game <= 30.0 and stage_24h not in reminded_stages:
+                        card_text = format_game_card(g, is_left, "Напоминание: матч завтра!")
+                        mid = send_msg(s_chat_id, f"🔔 *Внимание! Завтра игра:*\n\n{card_text}")
+                        if mid:
+                            reminded_stages.append(stage_24h)
+                            changed = True
+
+                    # За 3 часа до игры (окно 0.5..3.5 часов)
+                    stage_3h = f"{gid}:3h"
+                    if 0.5 <= hours_to_game <= 3.5 and stage_3h not in reminded_stages:
+                        card_text = format_game_card(g, is_left, "Внимание! До игры осталось 3 часа!")
+                        mid = send_msg(s_chat_id, f"🔥 *Матч уже скоро!*\n\n{card_text}")
+                        if mid:
+                            reminded_stages.append(stage_3h)
+                            changed = True
 
             if changed:
                 save_chats_config(cfg)
-        except Exception:
-            pass
+        except Exception as e:
+            safe_print(f"⚠️ Ошибка в auto_monitor_loop: {e}")
         time.sleep(CHECK_INTERVAL_SEC)
 
 import http.server
@@ -647,29 +841,55 @@ def run_bot():
         pass
 
     offset = 0
+    consecutive_errors = 0
+    backoff = 1.5
+
     while True:
         try:
             r = requests.get(
                 f"https://api.telegram.org/bot{TOKEN}/getUpdates",
                 params={"offset": offset, "timeout": 30},
                 timeout=35
-            ).json()
+            )
 
-            if not r.get("ok"):
-                desc = r.get("description", "Unknown error")
-                safe_print(f"⚠️ Ошибка Telegram API: {desc}")
-                time.sleep(3)
+            # Обработка 429 Too Many Requests от Telegram
+            if r.status_code == 429:
+                try:
+                    retry_after = int(r.json().get("parameters", {}).get("retry_after", 5))
+                except Exception:
+                    retry_after = 5
+                safe_print(f"⚠️ Telegram 429 в getUpdates. Ожидание {retry_after + 1} сек...")
+                time.sleep(retry_after + 1.0)
                 continue
 
-            for u in r.get("result", []):
+            resp_data = r.json()
+            if not resp_data.get("ok"):
+                desc = resp_data.get("description", "Unknown error")
+                safe_print(f"⚠️ Ошибка Telegram API: {desc}")
+                consecutive_errors += 1
+                time.sleep(min(backoff * (2 ** (consecutive_errors - 1)), 30.0))
+                continue
+
+            # Успешный опрос — сбрасываем счетчик ошибок
+            consecutive_errors = 0
+            backoff = 1.5
+
+            for u in resp_data.get("result", []):
                 offset = u["update_id"] + 1
                 msg = u.get("message") or u.get("channel_post")
                 if msg:
                     process_message(msg)
 
+        except requests.exceptions.RequestException as e:
+            consecutive_errors += 1
+            delay = min(backoff * (2 ** (consecutive_errors - 1)), 30.0)
+            safe_print(f"❌ Сбой сети в цикле опроса: {e}. Повтор через {delay:.1f} сек...")
+            time.sleep(delay)
         except Exception as e:
-            safe_print(f"❌ Ошибка в цикле: {e}")
-            time.sleep(3)
+            consecutive_errors += 1
+            delay = min(backoff * (2 ** (consecutive_errors - 1)), 30.0)
+            safe_print(f"❌ Непредвиденная ошибка в цикле: {e}. Повтор через {delay:.1f} сек...")
+            time.sleep(delay)
 
 if __name__ == "__main__":
     run_bot()
