@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import json
 import time
 import socket
@@ -31,6 +32,99 @@ def safe_print(*args, **kwargs):
             pass
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
+
+# Таблица нормализации визуально одинаковых букв (кириллица <-> латиница)
+HOMOGLYPHS = str.maketrans({
+    'a': 'а', 'c': 'с', 'e': 'е', 'k': 'к', 'o': 'о', 'p': 'р', 'x': 'х', 'y': 'у',
+    'A': 'а', 'B': 'в', 'C': 'с', 'E': 'е', 'H': 'н', 'K': 'к', 'M': 'м', 'O': 'о',
+    'P': 'р', 'T': 'т', 'X': 'х', 'Y': 'у',
+    'А': 'а', 'В': 'в', 'С': 'с', 'Е': 'е', 'Н': 'н', 'К': 'к', 'М': 'м', 'О': 'о',
+    'Р': 'р', 'Т': 'т', 'Х': 'х', 'У': 'у'
+})
+
+TRANSLIT_RU_TO_EN = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+    'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
+    'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya'
+}
+
+def translit_ru(s: str) -> str:
+    return "".join(TRANSLIT_RU_TO_EN.get(c, c) for c in (s or "").lower())
+
+def clean_alnum(s: str) -> str:
+    return re.sub(r"[^a-zа-я0-9]", "", (s or "").lower().replace("ё", "е"))
+
+def clean_homo(s: str) -> str:
+    return clean_alnum(s).translate(HOMOGLYPHS)
+
+def match_text(query: str, target: str) -> bool:
+    """Умное сопоставление названий: нечувствительно к пробелам, регистру, тире,
+    визуально одинаковым буквам (кириллица/латиница: X/Х, C/С) и транслитерации."""
+    if not query or not target:
+        return False
+    q_raw, t_raw = query.strip(), target.strip()
+    if not q_raw or not t_raw:
+        return False
+
+    q_low, t_low = q_raw.lower(), t_raw.lower()
+    if q_low == t_low:
+        return True
+
+    cq, ct = clean_alnum(q_raw), clean_alnum(t_raw)
+    if not cq or not ct:
+        return False
+    if cq == ct:
+        return True
+
+    # Для очень коротких запросов (1-2 символа) требуем точного совпадения слова
+    if len(cq) < 3:
+        return q_low in t_low.split() or cq in [clean_alnum(w) for w in t_low.split()]
+
+    if q_low in t_low:
+        return True
+
+    if cq in ct or (len(ct) >= 4 and ct in cq):
+        return True
+
+    hq, ht = clean_homo(q_raw), clean_homo(t_raw)
+    if hq in ht or (len(ht) >= 4 and ht in hq):
+        return True
+
+    tq, tt = clean_alnum(translit_ru(q_raw)), clean_alnum(translit_ru(t_raw))
+    if tq in tt or (len(tt) >= 4 and tt in tq):
+        return True
+
+    # Пословная проверка: все значимые слова запроса есть в названии
+    words_q = [w for w in re.split(r"[^a-zа-я0-9]+", q_low) if len(w) >= 2 and w not in ("бк", "bc", "team", "команда")]
+    if words_q:
+        all_in = True
+        for w in words_q:
+            hw = clean_homo(w)
+            tw = clean_alnum(translit_ru(w))
+            if hw not in ht and tw not in tt:
+                all_in = False
+                break
+        if all_in:
+            return True
+
+    return False
+
+def parse_team_and_division(text: str) -> tuple:
+    """Разбирает аргумент на (команда, дивизион). Поддерживает '|' и формат в скобках '(Дивизион)'."""
+    text = (text or "").strip()
+    if not text:
+        return "", ""
+    if "|" in text:
+        t, d = text.split("|", 1)
+        return t.strip(), d.strip()
+    m = re.match(r"^(.*?)\s*[\(\[](.*?)[\)\]]$", text)
+    if m:
+        t, d = m.group(1).strip(), m.group(2).strip()
+        if t:
+            return t, d
+    return text, ""
 
 # Принудительно используем IPv4 для Android / Termux (избегаем Errno 101 Network is unreachable)
 try:
@@ -104,9 +198,11 @@ def is_group_admin(chat_id: str | int, user_id: int) -> bool:
     return False
 
 def fetch_next_game(team_name: str, division_name: str = ""):
-    team_lower = (team_name or "").lower().strip()
-    div_lower = (division_name or "").lower().strip()
-    if not team_lower:
+    parsed_team, parsed_div = parse_team_and_division(team_name)
+    team_name = parsed_team or team_name
+    division_name = division_name or parsed_div
+
+    if not team_name:
         return None, "⚠️ Пожалуйста, укажите название команды: `/game НазваниеКоманды`"
 
     url = f"https://mtgame.ru/api/v1/league/{LEAGUE_ID}/games/"
@@ -133,9 +229,9 @@ def fetch_next_game(team_name: str, division_name: str = ""):
         t2 = (g.get("competitor_team") or {}).get("name") or ""
         tourn_name = (g.get("tournament") or {}).get("name") or ""
 
-        is_left = team_lower in t1.lower()
-        is_right = team_lower in t2.lower()
-        div_match = not div_lower or div_lower in tourn_name.lower()
+        is_left = match_text(team_name, t1)
+        is_right = match_text(team_name, t2)
+        div_match = not division_name or match_text(division_name, tourn_name)
 
         if (is_left or is_right) and div_match:
             dt_str = g.get("datetime")
@@ -178,9 +274,11 @@ def fetch_next_game(team_name: str, division_name: str = ""):
     return g.get("id"), text
 
 def fetch_schedule(team_name: str, division_name: str = "") -> str:
-    team_lower = (team_name or "").lower().strip()
-    div_lower = (division_name or "").lower().strip()
-    if not team_lower:
+    parsed_team, parsed_div = parse_team_and_division(team_name)
+    team_name = parsed_team or team_name
+    division_name = division_name or parsed_div
+
+    if not team_name:
         return "⚠️ Пожалуйста, укажите название команды: `/schedule НазваниеКоманды`"
 
     url = f"https://mtgame.ru/api/v1/league/{LEAGUE_ID}/games/"
@@ -206,9 +304,9 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
         t2 = (g.get("competitor_team") or {}).get("name") or ""
         tourn_name = (g.get("tournament") or {}).get("name") or ""
 
-        is_left = team_lower in t1.lower()
-        is_right = team_lower in t2.lower()
-        div_match = not div_lower or div_lower in tourn_name.lower()
+        is_left = match_text(team_name, t1)
+        is_right = match_text(team_name, t2)
+        div_match = not division_name or match_text(division_name, tourn_name)
 
         if (is_left or is_right) and div_match:
             dt_str = g.get("datetime")
@@ -437,10 +535,7 @@ def process_message(msg: dict):
                 send_msg(chat_id, "Укажите команду:\n`/set Название Команды`\nили с дивизионом:\n`/set Название Команды | Дивизион`")
                 return
 
-            if "|" in args:
-                team, division = [x.strip() for x in args.split("|", 1)]
-            else:
-                team, division = args, ""
+            team, division = parse_team_and_division(args)
 
             if not team:
                 send_msg(chat_id, "Укажите корректное название команды.")
@@ -484,11 +579,13 @@ def process_message(msg: dict):
             division_query = ""
 
             if team_query:
-                if "|" in team_query:
-                    team_query, division_query = [x.strip() for x in team_query.split("|", 1)]
+                team_query, division_query = parse_team_and_division(team_query)
             elif chat_id in cfg and cfg[chat_id].get("team"):
-                team_query = cfg[chat_id]["team"]
-                division_query = cfg[chat_id].get("division", "")
+                cfg_team = cfg[chat_id]["team"]
+                cfg_div = cfg[chat_id].get("division", "")
+                team_query, division_query = parse_team_and_division(cfg_team)
+                if not division_query:
+                    division_query = cfg_div
             else:
                 team_query = DEFAULT_TEAM
                 division_query = ""
@@ -506,11 +603,13 @@ def process_message(msg: dict):
             division_query = ""
 
             if team_query:
-                if "|" in team_query:
-                    team_query, division_query = [x.strip() for x in team_query.split("|", 1)]
+                team_query, division_query = parse_team_and_division(team_query)
             elif chat_id in cfg and cfg[chat_id].get("team"):
-                team_query = cfg[chat_id]["team"]
-                division_query = cfg[chat_id].get("division", "")
+                cfg_team = cfg[chat_id]["team"]
+                cfg_div = cfg[chat_id].get("division", "")
+                team_query, division_query = parse_team_and_division(cfg_team)
+                if not division_query:
+                    division_query = cfg_div
             else:
                 team_query = DEFAULT_TEAM
                 division_query = ""

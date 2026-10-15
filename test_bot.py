@@ -66,6 +66,71 @@ class TestAblBot(unittest.TestCase):
         self.assertIn("18.10.2026 в 19:30 (МСК)", text)
 
     @patch("main.requests.get")
+    def test_fetch_next_game_smart_match_hd_x_sever(self, mock_get):
+        # Точный кейс пользователя: запрос 'HD X Север' при базе с 'HDXСЕВЕР' и турниром 'PURE'
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [
+            {
+                "id": 163799,
+                "status": "open",
+                "team": {"name": "HDXСЕВЕР"},
+                "competitor_team": {"name": "Пиратская Руда"},
+                "tournament": {"name": "PURE"},
+                "datetime": "2026-10-17T14:00:00Z",
+                "location": "Волгоградский пр-т"
+            }
+        ]
+        mock_get.return_value = mock_resp
+
+        # Проверяем запрос без дивизиона
+        game_id, text = main.fetch_next_game("HD X Север")
+        self.assertEqual(game_id, 163799)
+        self.assertIn("HDXСЕВЕР — Пиратская Руда", text)
+        self.assertIn("⚪️ СВЕТЛАЯ", text)
+
+        # Проверяем запрос с дивизионом через пайп
+        game_id2, text2 = main.fetch_next_game("HD X Север", "PURE")
+        self.assertEqual(game_id2, 163799)
+
+        # Проверяем запрос с дивизионом в скобках
+        game_id3, text3 = main.fetch_next_game("HD X Север (PURE)")
+        self.assertEqual(game_id3, 163799)
+
+        # Проверяем с русской буквой Х вместо английской X
+        game_id4, text4 = main.fetch_next_game("HD \u0445 Север")
+        self.assertEqual(game_id4, 163799)
+
+    def test_parse_team_and_division(self):
+        self.assertEqual(main.parse_team_and_division("HD X Север | PURE"), ("HD X Север", "PURE"))
+        self.assertEqual(main.parse_team_and_division("HD X Север (PURE)"), ("HD X Север", "PURE"))
+        self.assertEqual(main.parse_team_and_division("HD X Север [PURE]"), ("HD X Север", "PURE"))
+        self.assertEqual(main.parse_team_and_division("БК Путилково"), ("БК Путилково", ""))
+        self.assertEqual(main.parse_team_and_division(""), ("", ""))
+
+    def test_match_text_comprehensive(self):
+        # Пробелы и регистр
+        self.assertTrue(main.match_text("HD X Север", "HDXСЕВЕР"))
+        self.assertTrue(main.match_text("hdxсевер", "HD X Север"))
+        self.assertTrue(main.match_text("HDX", "HDXСЕВЕР"))
+        self.assertTrue(main.match_text("Север", "HDXСЕВЕР"))
+        # Русская 'х' vs латинская 'x'
+        self.assertTrue(main.match_text("HD \u0445 Север", "HDXСЕВЕР"))
+        # Транслитерация
+        self.assertTrue(main.match_text("hd x sever", "HDxSEVER WOMEN"))
+        self.assertTrue(main.match_text("HD X Север", "HDxSEVER WOMEN"))
+        # Префикс БК и тире/кавычки
+        self.assertTrue(main.match_text("БК Путилково", "БК Путилково"))
+        self.assertTrue(main.match_text("Путилково", "БК Путилково"))
+        self.assertTrue(main.match_text("БК Путилково", "Путилково"))
+        self.assertTrue(main.match_text("Спартак-2", "Спартак 2"))
+        self.assertTrue(main.match_text("Пиратская руда", "Пиратская Руда"))
+        # Отрицательные тесты (не должно быть ложных срабатываний)
+        self.assertFalse(main.match_text("ЦСКА", "Спартак"))
+        self.assertFalse(main.match_text("Путилково", "HDXСЕВЕР"))
+        self.assertFalse(main.match_text("а", "Спартак"))
+        self.assertFalse(main.match_text("бк", "Спартак"))
+
+    @patch("main.requests.get")
     def test_fetch_next_game_no_games(self, mock_get):
         mock_resp = MagicMock()
         mock_resp.json.return_value = []
