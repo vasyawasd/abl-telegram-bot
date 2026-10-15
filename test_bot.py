@@ -5,7 +5,6 @@ import main
 
 class TestAblBot(unittest.TestCase):
     def setUp(self):
-        # Очищаем или изолируем конфигурацию чатов
         self.mock_config = {}
         def _save(cfg):
             self.mock_config.clear()
@@ -19,11 +18,11 @@ class TestAblBot(unittest.TestCase):
         self.patcher_load.stop()
         self.patcher_save.stop()
 
-    # --- 1. Next game fetching & formatting (включая проверку Timezone без zoneinfo) ---
+    # --- 1. Next game fetching & formatting (Timezone and Form) ---
 
     @patch("main.requests.get")
     def test_fetch_next_game_home_team_and_timezone(self, mock_get):
-        # 12:00 UTC должно стать 15:00 МСК (+3 часа)
+        # 12:00 UTC должно стать 15:00 МСК (+3 часа) без zoneinfo
         mock_resp = MagicMock()
         mock_resp.json.return_value = [
             {
@@ -43,7 +42,7 @@ class TestAblBot(unittest.TestCase):
         game_id, text = main.fetch_next_game("БК Путилково")
         self.assertEqual(game_id, 101)
         self.assertIn("БК Путилково — Соперник", text)
-        self.assertIn("⚪️ СВЕТЛАЯ", text)  # Левая команда = светлая форма
+        self.assertIn("⚪️ СВЕТЛАЯ", text)
         self.assertIn("18.10.2026 в 15:00 (МСК)", text)
 
     @patch("main.requests.get")
@@ -63,7 +62,7 @@ class TestAblBot(unittest.TestCase):
 
         game_id, text = main.fetch_next_game("БК Путилково")
         self.assertEqual(game_id, 102)
-        self.assertIn("⚫️ ЧЁРНАЯ", text)  # Правая команда = темная форма
+        self.assertIn("⚫️ ЧЁРНАЯ", text)
         self.assertIn("18.10.2026 в 19:30 (МСК)", text)
 
     @patch("main.requests.get")
@@ -76,6 +75,12 @@ class TestAblBot(unittest.TestCase):
         self.assertIsNone(game_id)
         self.assertIn("Пока нет открытых назначенных игр", text)
 
+    def test_fetch_next_game_empty_team_name(self):
+        # Пустое название команды не должно матчить случайные игры
+        game_id, text = main.fetch_next_game("")
+        self.assertIsNone(game_id)
+        self.assertIn("укажите название команды", text)
+
     @patch("main.requests.get")
     def test_fetch_next_game_network_error(self, mock_get):
         mock_get.side_effect = Exception("Connection timeout")
@@ -84,7 +89,7 @@ class TestAblBot(unittest.TestCase):
         self.assertIn("Не удалось получить данные о расписании ABL", text)
 
     @patch("main.requests.get")
-    def test_fetch_schedule(self, mock_get):
+    def test_fetch_schedule_success(self, mock_get):
         mock_resp = MagicMock()
         mock_resp.json.return_value = [
             {
@@ -111,18 +116,57 @@ class TestAblBot(unittest.TestCase):
         self.assertIn("75:68", text)
         self.assertIn("Новый Соперник", text)
 
-    # --- 2. Command handling (/game, /game Team, /abl, /schedule, /mlbl, etc.) ---
+    def test_fetch_schedule_empty_team_name(self):
+        text = main.fetch_schedule("")
+        self.assertIn("укажите название команды", text)
+
+    @patch("main.requests.get")
+    def test_fetch_schedule_missing_datetime(self, mock_get):
+        # Игра без объявленной даты должна выводить "Дата уточняется", а не 0001 год
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [
+            {
+                "id": 103,
+                "status": "open",
+                "team": {"name": "БК Путилково"},
+                "competitor_team": {"name": "Соперник 3"},
+                "datetime": None
+            }
+        ]
+        mock_get.return_value = mock_resp
+
+        text = main.fetch_schedule("БК Путилково")
+        self.assertIn("Дата уточняется", text)
+        self.assertNotIn("01.01 в 03:00", text)
+
+    # --- 2. Command handling (/start, /help, /game, /schedule, etc.) ---
 
     @patch("main.send_msg")
     def test_command_start_help_private(self, mock_send):
+        for cmd in ["/start", "/help"]:
+            msg = {
+                "text": cmd,
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": 12345}
+            }
+            main.process_message(msg)
+            self.assertIn("Привет!", mock_send.call_args[0][1])
+
+    @patch("main.send_msg")
+    def test_command_start_help_group_configured_and_unconfigured(self, mock_send):
+        # 1. Ненастроенная группа
         msg = {
             "text": "/start",
-            "chat": {"id": 12345, "type": "private"},
-            "from": {"id": 12345}
+            "chat": {"id": -100888, "type": "group"},
+            "from": {"id": 123}
         }
         main.process_message(msg)
-        mock_send.assert_called_once()
-        self.assertIn("Привет!", mock_send.call_args[0][1])
+        self.assertIn("пока не настроена отдельная команда", mock_send.call_args[0][1])
+
+        # 2. Настроенная группа
+        self.mock_config["-100888"] = {"team": "Химки", "division": "Див 1"}
+        main.process_message(msg)
+        self.assertIn("Этот чат настроен на команду: *Химки*", mock_send.call_args[0][1])
 
     @patch("main.send_msg")
     @patch("main.fetch_next_game")
@@ -151,8 +195,32 @@ class TestAblBot(unittest.TestCase):
 
     @patch("main.send_msg")
     @patch("main.fetch_next_game")
+    def test_command_game_with_pipe_division(self, mock_fetch, mock_send):
+        mock_fetch.return_value = (999, "Игра Спартак Дивизион 1")
+        msg = {
+            "text": "/game Спартак | Дивизион 1",
+            "chat": {"id": 12345, "type": "private"},
+            "from": {"id": 12345}
+        }
+        main.process_message(msg)
+        mock_fetch.assert_called_with("Спартак", "Дивизион 1")
+
+    @patch("main.send_msg")
+    @patch("main.fetch_next_game")
+    def test_command_game_with_empty_pipe(self, mock_fetch, mock_send):
+        # /game | должен безопасно использовать команду по умолчанию
+        mock_fetch.return_value = (999, "Игра БК Путилково")
+        msg = {
+            "text": "/game |",
+            "chat": {"id": 12345, "type": "private"},
+            "from": {"id": 12345}
+        }
+        main.process_message(msg)
+        mock_fetch.assert_called_with("БК Путилково", "")
+
+    @patch("main.send_msg")
+    @patch("main.fetch_next_game")
     def test_command_game_with_bot_mention(self, mock_fetch, mock_send):
-        # Проверяем, что /game@abl_bot Спартак не подмешивает имя бота в название команды
         mock_fetch.return_value = (999, "Игра Спартак")
         msg = {
             "text": "/game@abl_basket_bot Спартак",
@@ -165,7 +233,6 @@ class TestAblBot(unittest.TestCase):
     @patch("main.send_msg")
     @patch("main.fetch_next_game")
     def test_command_game_mention_without_args(self, mock_fetch, mock_send):
-        # /game@abl_basket_bot без аргументов
         self.mock_config["-100999"] = {"team": "Моя Команда", "division": ""}
         mock_fetch.return_value = (999, "Игра Моя Команда")
         msg = {
@@ -249,11 +316,8 @@ class TestAblBot(unittest.TestCase):
             "from": {"id": 999}
         }
         main.process_message(msg)
-        # Отправлено предупреждение
         mock_send.assert_called_with("-100555", "⛔️ Только администратор этой группы может настраивать или менять команду.")
-        # Запланировано автоудаление
         mock_delete.assert_called_once_with("-100555", [555, 444], delay=1.5)
-        # Конфигурация не изменена
         self.assertNotIn("-100555", self.mock_config)
 
     @patch("main.send_msg")
@@ -271,6 +335,46 @@ class TestAblBot(unittest.TestCase):
         self.assertEqual(self.mock_config["-100555"]["division"], "Первый дивизион")
 
     @patch("main.send_msg")
+    def test_sender_chat_none_does_not_crash(self, mock_send):
+        # Критичный тест: sender_chat: None не должен вызывать AttributeError
+        msg = {
+            "message_id": 100,
+            "text": "/game",
+            "chat": {"id": -100555, "type": "supergroup"},
+            "sender_chat": None,
+            "from": {"id": 123}
+        }
+        main.process_message(msg)
+        mock_send.assert_called_once()
+
+    @patch("main.send_msg")
+    def test_anonymous_admin_allowed_in_group(self, mock_send):
+        # Анонимный администратор шлет от имени чата (sender_chat.id == chat.id)
+        msg = {
+            "message_id": 101,
+            "text": "/set Рубин",
+            "chat": {"id": -100555, "type": "supergroup"},
+            "sender_chat": {"id": -100555},
+            "from": None
+        }
+        main.process_message(msg)
+        self.assertIn("-100555", self.mock_config)
+        self.assertEqual(self.mock_config["-100555"]["team"], "Рубин")
+
+    @patch("main.send_msg")
+    def test_channel_post_allowed(self, mock_send):
+        # В канале сообщения отправляют только администраторы
+        msg = {
+            "message_id": 102,
+            "text": "/set Динамо",
+            "chat": {"id": -100777, "type": "channel"},
+            "from": None
+        }
+        main.process_message(msg)
+        self.assertIn("-100777", self.mock_config)
+        self.assertEqual(self.mock_config["-100777"]["team"], "Динамо")
+
+    @patch("main.send_msg")
     @patch("main.is_group_admin", return_value=True)
     def test_unset_command(self, mock_admin, mock_send):
         self.mock_config["-100555"] = {"team": "Химки", "division": ""}
@@ -283,7 +387,69 @@ class TestAblBot(unittest.TestCase):
         self.assertNotIn("-100555", self.mock_config)
         self.assertIn("удалена", mock_send.call_args[0][1])
 
-    # --- 5. Edge cases ---
+    # --- 5. Message deletion logic tests (delete_msg & delete_later) ---
+
+    @patch("main.requests.post")
+    def test_delete_msg_success_and_failure(self, mock_post):
+        mock_resp_ok = MagicMock()
+        mock_resp_ok.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp_ok
+
+        main.delete_msg("12345", 555)
+        mock_post.assert_called_with(
+            f"https://api.telegram.org/bot{main.TOKEN}/deleteMessage",
+            json={"chat_id": "12345", "message_id": 555},
+            timeout=5
+        )
+
+        # Проверка безопасного перехвата сетевой ошибки
+        mock_post.side_effect = Exception("Network error")
+        try:
+            main.delete_msg("12345", 555)
+        except Exception:
+            self.fail("delete_msg threw an uncaught exception on network error")
+
+    @patch("main.delete_msg")
+    @patch("main.requests.post")
+    def test_delete_later_batch_success(self, mock_post, mock_del_msg):
+        # deleteMessages успешен -> поштучное удаление не вызывается
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        # Тестируем worker напрямую без задержки
+        with patch("main.threading.Thread") as mock_thread:
+            main.delete_later("12345", [10, 20, "30", None], delay=0)
+            mock_thread.assert_called_once()
+            worker = mock_thread.call_args[1]["target"]
+            worker()
+
+        mock_post.assert_called_once_with(
+            f"https://api.telegram.org/bot{main.TOKEN}/deleteMessages",
+            json={"chat_id": "12345", "message_ids": [10, 20, 30]},
+            timeout=5
+        )
+        mock_del_msg.assert_not_called()
+
+    @patch("main.delete_msg")
+    @patch("main.requests.post")
+    def test_delete_later_fallback_to_individual(self, mock_post, mock_del_msg):
+        # deleteMessages вернул ok: False -> фолбэк на delete_msg для каждого id
+        mock_resp_fail = MagicMock()
+        mock_resp_fail.json.return_value = {"ok": False, "description": "Not allowed"}
+        mock_post.return_value = mock_resp_fail
+
+        with patch("main.threading.Thread") as mock_thread:
+            with patch("time.sleep"):
+                main.delete_later("12345", [10, 20], delay=0)
+                worker = mock_thread.call_args[1]["target"]
+                worker()
+
+        self.assertEqual(mock_del_msg.call_count, 2)
+        mock_del_msg.assert_any_call("12345", 10)
+        mock_del_msg.assert_any_call("12345", 20)
+
+    # --- 6. Edge cases & Markdown fallback ---
 
     @patch("main.send_msg")
     def test_just_slash_and_unknown_command(self, mock_send):
@@ -294,7 +460,6 @@ class TestAblBot(unittest.TestCase):
                 "from": {"id": 12345}
             }
             main.process_message(msg)
-        # Неизвестные команды и одиночный слэш не должны вызывать падений или невалидных ответов
         mock_send.assert_not_called()
 
     @patch("main.send_msg")
@@ -309,8 +474,6 @@ class TestAblBot(unittest.TestCase):
 
     @patch("main.requests.post")
     def test_send_msg_markdown_fallback(self, mock_post):
-        # 1-й вызов с Markdown возвращает ошибку (например, неэкранированный спецсимвол)
-        # 2-й вызов без parse_mode успешен
         mock_resp_fail = MagicMock()
         mock_resp_fail.json.return_value = {"ok": False, "description": "Bad Request: can't parse entities"}
         mock_resp_ok = MagicMock()
@@ -320,7 +483,6 @@ class TestAblBot(unittest.TestCase):
         mid = main.send_msg("12345", "Текст с *незакрытой звездочкой")
         self.assertEqual(mid, 9999)
         self.assertEqual(mock_post.call_count, 2)
-        # Проверяем, что второй вызов был без parse_mode
         self.assertNotIn("parse_mode", mock_post.call_args_list[1][1]["json"])
 
 if __name__ == "__main__":

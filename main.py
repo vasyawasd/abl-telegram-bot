@@ -39,29 +39,39 @@ try:
 except Exception:
     pass
 
-def get_bot_token():
-    t = os.getenv("BOT_TOKEN")
-    if not t and os.path.exists(".env"):
+def load_env_file():
+    if os.path.exists(".env"):
         try:
             with open(".env", "r", encoding="utf-8") as f:
                 for line in f:
-                    if line.startswith("BOT_TOKEN="):
-                        t = line.strip().split("=", 1)[1].strip().strip('"').strip("'")
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
         except Exception:
             pass
+
+load_env_file()
+
+def get_bot_token():
+    t = os.getenv("BOT_TOKEN", "").strip()
     if not t:
         try:
             t = input("Введите токен Telegram-бота (BOT_TOKEN): ").strip()
             if t:
-                with open(".env", "w", encoding="utf-8") as f:
-                    f.write(f"BOT_TOKEN={t}\n")
+                os.environ["BOT_TOKEN"] = t
+                with open(".env", "a", encoding="utf-8") as f:
+                    f.write(f"\nBOT_TOKEN={t}\n")
         except Exception:
             pass
     return t or ""
 
 TOKEN = get_bot_token()
 LEAGUE_ID = int(os.getenv("LEAGUE_ID", "2"))
-DEFAULT_TEAM = os.getenv("DEFAULT_TEAM", "БК Путилково")
+DEFAULT_TEAM = (os.getenv("DEFAULT_TEAM") or os.getenv("TEAM_NAME") or "БК Путилково").strip() or "БК Путилково"
 CHECK_INTERVAL_SEC = 600
 CHATS_FILE = "chats.json"
 
@@ -94,6 +104,11 @@ def is_group_admin(chat_id: str | int, user_id: int) -> bool:
     return False
 
 def fetch_next_game(team_name: str, division_name: str = ""):
+    team_lower = (team_name or "").lower().strip()
+    div_lower = (division_name or "").lower().strip()
+    if not team_lower:
+        return None, "⚠️ Пожалуйста, укажите название команды: `/game НазваниеКоманды`"
+
     url = f"https://mtgame.ru/api/v1/league/{LEAGUE_ID}/games/"
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"}
     try:
@@ -107,8 +122,6 @@ def fetch_next_game(team_name: str, division_name: str = ""):
         return None, "⚠️ Не удалось получить данные о расписании ABL. Попробуйте позже."
 
     now = datetime.now(timezone.utc)
-    team_lower = (team_name or "").lower().strip()
-    div_lower = (division_name or "").lower().strip()
     upcoming = []
 
     for g in resp:
@@ -165,6 +178,11 @@ def fetch_next_game(team_name: str, division_name: str = ""):
     return g.get("id"), text
 
 def fetch_schedule(team_name: str, division_name: str = "") -> str:
+    team_lower = (team_name or "").lower().strip()
+    div_lower = (division_name or "").lower().strip()
+    if not team_lower:
+        return "⚠️ Пожалуйста, укажите название команды: `/schedule НазваниеКоманды`"
+
     url = f"https://mtgame.ru/api/v1/league/{LEAGUE_ID}/games/"
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"}
     try:
@@ -178,8 +196,7 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
         return "⚠️ Не удалось получить данные о расписании ABL. Попробуйте позже."
 
     now = datetime.now(timezone.utc)
-    team_lower = (team_name or "").lower().strip()
-    div_lower = (division_name or "").lower().strip()
+    min_dt = datetime.min.replace(tzinfo=timezone.utc)
     team_games = []
 
     for g in resp:
@@ -195,7 +212,7 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
 
         if (is_left or is_right) and div_match:
             dt_str = g.get("datetime")
-            dt = datetime.min.replace(tzinfo=timezone.utc)
+            dt = min_dt
             if dt_str:
                 try:
                     dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
@@ -209,8 +226,8 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
         div_hint = f" ({division_name})" if division_name else ""
         return f"Игр для команды *{team_name}*{div_hint} не найдено."
 
-    team_games.sort(key=lambda x: x[0])
-    upcoming = [x for x in team_games if x[1].get("status") == "open" and x[0] >= now]
+    team_games.sort(key=lambda x: (x[0] == min_dt, x[0]))
+    upcoming = [x for x in team_games if x[1].get("status") == "open" and (x[0] >= now or x[0] == min_dt)]
     finished = [x for x in team_games if x[1].get("status") == "closed"]
 
     lines = [f"📅 *Календарь матчей ABL для {team_name}:*\n"]
@@ -221,7 +238,8 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
             opp = t2 if is_left else t1
             form = "⚪️ СВЕТЛАЯ" if is_left else "⚫️ ЧЁРНАЯ"
             court = (g.get("tournament_court") or {}).get("name") or g.get("location") or "Зал уточняется"
-            lines.append(f"• *{msk_dt.strftime('%d.%m в %H:%M')}* — vs {opp} ({form}) | {court}")
+            time_display = msk_dt.strftime('%d.%m в %H:%M') if dt > datetime(2000, 1, 1, tzinfo=timezone.utc) else "Дата уточняется"
+            lines.append(f"• *{time_display}* — vs {opp} ({form}) | {court}")
 
     if finished:
         lines.append("\n*🏁 Завершённые матчи:*")
@@ -268,7 +286,8 @@ def delete_msg(chat_id: int | str, message_id: int):
 def delete_later(chat_id: int | str, message_ids: list, delay: float = 3.0):
     """Удаляет список сообщений через delay секунд (в фоне, чтобы не блокировать бота)."""
     def _worker():
-        time.sleep(delay)
+        if delay > 0:
+            time.sleep(delay)
         valid_ids = []
         for m in message_ids:
             if m:
@@ -294,9 +313,10 @@ def delete_later(chat_id: int | str, message_ids: list, delay: float = 3.0):
             pass
 
         # 2. Поштучное удаление с небольшой паузой
-        for mid in valid_ids:
+        for i, mid in enumerate(valid_ids):
             delete_msg(chat_id, mid)
-            time.sleep(0.3)
+            if i < len(valid_ids) - 1:
+                time.sleep(0.3)
     threading.Thread(target=_worker, daemon=True).start()
 
 
@@ -308,6 +328,8 @@ def auto_monitor_loop():
             cfg = load_chats_config()
             changed = False
             for s_chat_id, info in cfg.items():
+                if not isinstance(info, dict):
+                    continue
                 team = info.get("team")
                 if not team:
                     continue
@@ -357,13 +379,16 @@ def process_message(msg: dict):
         if not raw_text.startswith("/"):
             return
 
-        chat_id = str(msg.get("chat", {}).get("id", ""))
+        chat_id = str((msg.get("chat") or {}).get("id", ""))
         if not chat_id:
             return
 
-        user_id = msg.get("from", {}).get("id", 0)
-        is_private = msg.get("chat", {}).get("type") == "private"
-        is_anon_admin = (msg.get("sender_chat", {}).get("id") == msg.get("chat", {}).get("id"))
+        user_id = (msg.get("from") or {}).get("id", 0)
+        chat_type = (msg.get("chat") or {}).get("type", "")
+        is_private = (chat_type == "private")
+        is_channel = (chat_type == "channel")
+        sender_chat_id = (msg.get("sender_chat") or {}).get("id")
+        is_anon_admin = bool(sender_chat_id and str(sender_chat_id) == chat_id)
 
         parts = raw_text.split(None, 1)
         cmd_token = parts[0]
@@ -403,7 +428,7 @@ def process_message(msg: dict):
 
         # --- 2. НАСТРОЙКА КОМАНДЫ ДЛЯ ЧАТА (ТОЛЬКО ДЛЯ АДМИНИСТРАТОРОВ) ---
         if cmd in ["/set", "/team"]:
-            if not is_private and not is_anon_admin and not is_group_admin(chat_id, user_id):
+            if not is_private and not is_channel and not is_anon_admin and not is_group_admin(chat_id, user_id):
                 w_id = send_msg(chat_id, "⛔️ Только администратор этой группы может настраивать или менять команду.")
                 delete_later(chat_id, [w_id, msg.get("message_id")], delay=1.5)
                 return
@@ -439,7 +464,7 @@ def process_message(msg: dict):
 
         # --- 2.1 СБРОС / ОТВЯЗКА КОМАНДЫ (ТОЛЬКО ДЛЯ АДМИНИСТРАТОРОВ) ---
         if cmd in ["/unset", "/reset"]:
-            if not is_private and not is_anon_admin and not is_group_admin(chat_id, user_id):
+            if not is_private and not is_channel and not is_anon_admin and not is_group_admin(chat_id, user_id):
                 w_id = send_msg(chat_id, "⛔️ Только администратор этой группы может отвязать команду.")
                 delete_later(chat_id, [w_id, msg.get("message_id")], delay=1.5)
                 return
@@ -468,6 +493,9 @@ def process_message(msg: dict):
                 team_query = DEFAULT_TEAM
                 division_query = ""
 
+            if not team_query:
+                team_query = DEFAULT_TEAM
+
             _, reply = fetch_next_game(team_query, division_query)
             send_msg(chat_id, reply)
             return
@@ -486,6 +514,9 @@ def process_message(msg: dict):
             else:
                 team_query = DEFAULT_TEAM
                 division_query = ""
+
+            if not team_query:
+                team_query = DEFAULT_TEAM
 
             reply = fetch_schedule(team_query, division_query)
             send_msg(chat_id, reply)
