@@ -2,10 +2,18 @@ import os
 import unittest
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
+
+# Тесты никогда не должны брать рабочий токен из .env и случайно писать в настоящий чат.
+os.environ["BOT_TOKEN"] = "test-token"
 import main
+
+def reset_abl_cache():
+    main.ABL_GAMES_CACHE = []
+    main.ABL_GAMES_CACHE_TIME = 0.0
 
 class TestAblBot(unittest.TestCase):
     def setUp(self):
+        reset_abl_cache()
         self.mock_config = {}
         def _save(cfg):
             self.mock_config.clear()
@@ -21,10 +29,10 @@ class TestAblBot(unittest.TestCase):
 
     # --- 1. Next game fetching & formatting (Timezone and Form) ---
 
-    @patch("main.requests.get")
+    @patch("main.http_get")
     def test_fetch_next_game_home_team_and_timezone(self, mock_get):
         # 12:00 UTC должно стать 15:00 МСК (+3 часа) без zoneinfo
-        mock_resp = MagicMock()
+        mock_resp = MagicMock(status_code=200, headers={})
         mock_resp.json.return_value = [
             {
                 "id": 101,
@@ -35,7 +43,7 @@ class TestAblBot(unittest.TestCase):
                 "tournament_tour": 1,
                 "tournament_court": {"name": "Зал 1"},
                 "location": "Москва",
-                "datetime": "2026-10-18T12:00:00Z"
+                "datetime": "2030-10-18T12:00:00Z"
             }
         ]
         mock_get.return_value = mock_resp
@@ -44,11 +52,11 @@ class TestAblBot(unittest.TestCase):
         self.assertEqual(game_id, 101)
         self.assertIn("БК Путилково — Соперник", text)
         self.assertIn("⚪️ СВЕТЛАЯ", text)
-        self.assertIn("18.10.2026 в 15:00 (МСК)", text)
+        self.assertIn("18.10.2030 в 15:00 (МСК)", text)
 
-    @patch("main.requests.get")
+    @patch("main.http_get")
     def test_fetch_next_game_away_team(self, mock_get):
-        mock_resp = MagicMock()
+        mock_resp = MagicMock(status_code=200, headers={})
         mock_resp.json.return_value = [
             {
                 "id": 102,
@@ -56,7 +64,7 @@ class TestAblBot(unittest.TestCase):
                 "team": {"name": "Хозяева"},
                 "competitor_team": {"name": "БК Путилково"},
                 "tournament": {"name": "Лига 1"},
-                "datetime": "2026-10-18T16:30:00Z"
+                "datetime": "2030-10-18T16:30:00Z"
             }
         ]
         mock_get.return_value = mock_resp
@@ -64,12 +72,12 @@ class TestAblBot(unittest.TestCase):
         game_id, text = main.fetch_next_game("БК Путилково")
         self.assertEqual(game_id, 102)
         self.assertIn("⚫️ ЧЁРНАЯ", text)
-        self.assertIn("18.10.2026 в 19:30 (МСК)", text)
+        self.assertIn("18.10.2030 в 19:30 (МСК)", text)
 
-    @patch("main.requests.get")
+    @patch("main.http_get")
     def test_fetch_next_game_smart_match_hd_x_sever(self, mock_get):
         # Точный кейс пользователя: запрос 'HD X Север' при базе с 'HDXСЕВЕР' и турниром 'PURE'
-        mock_resp = MagicMock()
+        mock_resp = MagicMock(status_code=200, headers={})
         mock_resp.json.return_value = [
             {
                 "id": 163799,
@@ -77,7 +85,7 @@ class TestAblBot(unittest.TestCase):
                 "team": {"name": "HDXСЕВЕР"},
                 "competitor_team": {"name": "Пиратская Руда"},
                 "tournament": {"name": "PURE"},
-                "datetime": "2026-10-17T14:00:00Z",
+                "datetime": "2030-10-17T14:00:00Z",
                 "location": "Волгоградский пр-т"
             }
         ]
@@ -131,9 +139,9 @@ class TestAblBot(unittest.TestCase):
         self.assertFalse(main.match_text("а", "Спартак"))
         self.assertFalse(main.match_text("бк", "Спартак"))
 
-    @patch("main.requests.get")
+    @patch("main.http_get")
     def test_fetch_next_game_no_games(self, mock_get):
-        mock_resp = MagicMock()
+        mock_resp = MagicMock(status_code=200, headers={})
         mock_resp.json.return_value = []
         mock_get.return_value = mock_resp
 
@@ -147,16 +155,16 @@ class TestAblBot(unittest.TestCase):
         self.assertIsNone(game_id)
         self.assertIn("укажите название команды", text)
 
-    @patch("main.requests.get")
+    @patch("main.http_get")
     def test_fetch_next_game_network_error(self, mock_get):
         mock_get.side_effect = Exception("Connection timeout")
         game_id, text = main.fetch_next_game("БК Путилково")
         self.assertIsNone(game_id)
         self.assertIn("Не удалось получить данные о расписании ABL", text)
 
-    @patch("main.requests.get")
+    @patch("main.http_get")
     def test_fetch_schedule_success(self, mock_get):
-        mock_resp = MagicMock()
+        mock_resp = MagicMock(status_code=200, headers={})
         mock_resp.json.return_value = [
             {
                 "id": 101,
@@ -172,7 +180,7 @@ class TestAblBot(unittest.TestCase):
                 "status": "open",
                 "team": {"name": "БК Путилково"},
                 "competitor_team": {"name": "Новый Соперник"},
-                "datetime": "2026-10-25T12:00:00Z"
+                "datetime": "2030-10-25T12:00:00Z"
             }
         ]
         mock_get.return_value = mock_resp
@@ -186,10 +194,10 @@ class TestAblBot(unittest.TestCase):
         text = main.fetch_schedule("")
         self.assertIn("укажите название команды", text)
 
-    @patch("main.requests.get")
+    @patch("main.http_get")
     def test_fetch_schedule_missing_datetime(self, mock_get):
         # Игра без объявленной даты должна выводить "Дата уточняется", а не 0001 год
-        mock_resp = MagicMock()
+        mock_resp = MagicMock(status_code=200, headers={})
         mock_resp.json.return_value = [
             {
                 "id": 103,
@@ -455,7 +463,7 @@ class TestAblBot(unittest.TestCase):
 
     # --- 5. Message deletion logic tests (delete_msg & delete_later) ---
 
-    @patch("main.requests.post")
+    @patch("main.http_post")
     def test_delete_msg_success_and_failure(self, mock_post):
         mock_resp_ok = MagicMock()
         mock_resp_ok.json.return_value = {"ok": True}
@@ -465,7 +473,7 @@ class TestAblBot(unittest.TestCase):
         mock_post.assert_called_with(
             f"https://api.telegram.org/bot{main.TOKEN}/deleteMessage",
             json={"chat_id": "12345", "message_id": 555},
-            timeout=5
+            timeout=main.TG_TIMEOUT
         )
 
         # Проверка безопасного перехвата сетевой ошибки
@@ -476,7 +484,7 @@ class TestAblBot(unittest.TestCase):
             self.fail("delete_msg threw an uncaught exception on network error")
 
     @patch("main.delete_msg")
-    @patch("main.requests.post")
+    @patch("main.http_post")
     def test_delete_later_batch_success(self, mock_post, mock_del_msg):
         # deleteMessages успешен -> поштучное удаление не вызывается
         mock_resp = MagicMock()
@@ -493,12 +501,12 @@ class TestAblBot(unittest.TestCase):
         mock_post.assert_called_once_with(
             f"https://api.telegram.org/bot{main.TOKEN}/deleteMessages",
             json={"chat_id": "12345", "message_ids": [10, 20, 30]},
-            timeout=5
+            timeout=main.TG_TIMEOUT
         )
         mock_del_msg.assert_not_called()
 
     @patch("main.delete_msg")
-    @patch("main.requests.post")
+    @patch("main.http_post")
     def test_delete_later_fallback_to_individual(self, mock_post, mock_del_msg):
         # deleteMessages вернул ok: False -> фолбэк на delete_msg для каждого id
         mock_resp_fail = MagicMock()
@@ -538,7 +546,7 @@ class TestAblBot(unittest.TestCase):
         main.process_message(msg)
         self.assertIn("Укажите команду", mock_send.call_args[0][1])
 
-    @patch("main.requests.post")
+    @patch("main.http_post")
     def test_send_msg_markdown_fallback(self, mock_post):
         mock_resp_fail = MagicMock()
         mock_resp_fail.json.return_value = {"ok": False, "description": "Bad Request: can't parse entities"}
@@ -557,6 +565,7 @@ class TestAblResilience(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.orig_chats_file = main.CHATS_FILE
         main.CHATS_FILE = os.path.join(self.test_dir, "test_chats.json")
+        reset_abl_cache()
 
     def tearDown(self):
         import shutil
@@ -585,7 +594,7 @@ class TestAblResilience(unittest.TestCase):
         self.assertEqual(recovered["12345"]["team"], "БК Путилково")
 
     @patch("main.time.sleep")
-    @patch("main.requests.post")
+    @patch("main.http_post")
     def test_send_msg_429_retry_after(self, mock_post, mock_sleep):
         resp_429 = MagicMock()
         resp_429.status_code = 429
@@ -601,7 +610,7 @@ class TestAblResilience(unittest.TestCase):
         self.assertEqual(mid, 777)
         mock_sleep.assert_called_with(3.0)  # retry_after + 1.0
 
-    @patch("main.requests.post")
+    @patch("main.http_post")
     def test_send_msg_403_kicked_disables_chat(self, mock_post):
         main.save_chats_config({"99999": {"team": "БК Путилково", "enabled": True}})
 
@@ -671,8 +680,8 @@ class TestAblResilience(unittest.TestCase):
 
         saved = main.load_chats_config()
         stages = saved["12345"]["reminded_stages"]
-        self.assertIn("1001:24h", stages)
-        self.assertIn("1002:3h", stages)
+        self.assertTrue(any(k.startswith("1001:") and k.endswith(":24h") for k in stages))
+        self.assertTrue(any(k.startswith("1002:") and k.endswith(":3h") for k in stages))
 
         # Повторный запуск мониторинга: НЕ должно быть повторных отправок (идемпотентность)!
         mock_send.reset_mock()
@@ -684,6 +693,186 @@ class TestAblResilience(unittest.TestCase):
                     pass
 
         mock_send.assert_not_called()
+
+
+def _game(gid, hours_from_now, team="БК Путилково", opp="Соперник"):
+    dt = datetime.now(timezone.utc) + timedelta(hours=hours_from_now)
+    return {"id": gid, "status": "open", "team": {"name": team}, "competitor_team": {"name": opp},
+            "tournament": {"name": "Лига 1"}, "datetime": dt.strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+def _ok_resp(data):
+    r = MagicMock(status_code=200, headers={})
+    r.json.return_value = data
+    return r
+
+
+class TestReliability(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.test_dir = tempfile.mkdtemp()
+        self.orig_chats_file = main.CHATS_FILE
+        main.CHATS_FILE = os.path.join(self.test_dir, "chats.json")
+        reset_abl_cache()
+        self.sleep = patch("main.time.sleep").start()
+
+    def tearDown(self):
+        import shutil
+        patch.stopall()
+        main.CHATS_FILE = self.orig_chats_file
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    # --- ABL API: повторы и кэш ---
+
+    @patch("main.http_get")
+    def test_abl_retries_transient_errors(self, mock_get):
+        import requests
+        bad = MagicMock(status_code=502, headers={})
+        bad.json.side_effect = ValueError("not json")
+        mock_get.side_effect = [requests.exceptions.ConnectionError("reset"), bad, _ok_resp([_game(1, 10)])]
+        games = main.fetch_raw_abl_games()
+        self.assertEqual(len(games), 1)
+        self.assertEqual(mock_get.call_count, 3)
+
+    @patch("main.http_get")
+    def test_abl_uses_stale_cache_for_commands_on_outage(self, mock_get):
+        import requests
+        main.ABL_GAMES_CACHE = [_game(1, 10)]
+        main.ABL_GAMES_CACHE_TIME = main.time.time() - 600  # 10 мин — не свежий, но годный
+        mock_get.side_effect = requests.exceptions.ConnectionError("down")
+        game_id, _ = main.fetch_next_game("БК Путилково")
+        self.assertEqual(game_id, 1)
+
+    @patch("main.http_get")
+    def test_abl_fresh_cache_skips_request(self, mock_get):
+        main.ABL_GAMES_CACHE = [_game(1, 10)]
+        main.ABL_GAMES_CACHE_TIME = main.time.time()
+        self.assertEqual(len(main.fetch_raw_abl_games()), 1)
+        mock_get.assert_not_called()
+
+    @patch("main.http_get")
+    def test_abl_fetches_next_page_when_it_may_contain_future_games(self, mock_get):
+        p1 = _ok_resp([_game(1, 50)])
+        p1.headers = {"X-Page-Next-Link": "http://x/?page=2"}
+        p2 = _ok_resp([_game(2, -50)])
+        p2.headers = {"X-Page-Next-Link": "http://x/?page=3"}
+        mock_get.side_effect = [p1, p2]
+        games = main.fetch_raw_abl_games()
+        self.assertEqual([g["id"] for g in games], [1, 2])
+        self.assertEqual(mock_get.call_count, 2)  # на 2-й странице только прошлое — дальше не идём
+
+    # --- send_msg ---
+
+    @patch("main.http_post")
+    def test_send_msg_retries_network_error_and_is_bounded(self, mock_post):
+        import requests
+        mock_post.side_effect = requests.exceptions.ConnectionError("down")
+        self.assertIsNone(main.send_msg("1", "x"))
+        self.assertEqual(mock_post.call_count, main.SEND_ATTEMPTS)
+
+    @patch("main.http_post")
+    def test_send_msg_429_is_bounded(self, mock_post):
+        r = MagicMock(status_code=429)
+        r.json.return_value = {"ok": False, "parameters": {"retry_after": 1}}
+        mock_post.return_value = r
+        self.assertIsNone(main.send_msg("1", "x"))
+        self.assertEqual(mock_post.call_count, main.SEND_ATTEMPTS)
+
+    # --- Отложенные напоминания ---
+
+    def _run_tick(self, games, send_ret=1):
+        with patch("main.fetch_raw_abl_games", return_value=games), \
+             patch("main.send_msg", return_value=send_ret) as ms:
+            ok = main.monitor_tick()
+        return ok, ms
+
+    def test_missed_24h_is_caught_up_after_downtime(self):
+        # Бот лежал, проснулся за 10 часов до игры — 24ч-напоминание всё равно должно прийти
+        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5, "reminded_stages": ["5:announced"]}})
+        ok, ms = self._run_tick([_game(5, 10)])
+        self.assertTrue(ok)
+        self.assertEqual(ms.call_count, 1)
+        self.assertIn("игра", ms.call_args[0][1])
+
+    def test_3h_marks_24h_to_avoid_double_message(self):
+        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5, "reminded_stages": ["5:announced"]}})
+        games = [_game(5, 2)]
+        _, ms = self._run_tick(games)
+        self.assertEqual(ms.call_count, 1)
+        # Час спустя та же игра: ни 3ч, ни запоздалое 24ч повторно не отправляются
+        with patch("main.fetch_raw_abl_games", return_value=games), \
+             patch("main.send_msg", return_value=1) as ms2:
+            main.monitor_tick(datetime.now(timezone.utc) + timedelta(hours=1))
+        ms2.assert_not_called()
+
+    def test_rescheduled_game_gets_new_reminder(self):
+        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5, "reminded_stages": ["5:announced"]}})
+        self._run_tick([_game(5, 24)])
+        _, ms = self._run_tick([_game(5, 24)])
+        ms.assert_not_called()
+        _, ms = self._run_tick([_game(5, 20)])  # игру перенесли на 4 часа
+        self.assertEqual(ms.call_count, 1)
+
+    def test_failed_send_is_retried_next_tick(self):
+        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5, "reminded_stages": ["5:announced"]}})
+        self._run_tick([_game(5, 24)], send_ret=None)
+        _, ms = self._run_tick([_game(5, 24)])
+        self.assertEqual(ms.call_count, 1)
+
+    def test_tick_reports_failure_when_api_down(self):
+        ok, ms = self._run_tick(None)
+        self.assertFalse(ok)
+        ms.assert_not_called()
+
+    def test_monitor_does_not_resurrect_unset_chat(self):
+        main.save_chats_config({"1": {"team": "БК Путилково", "reminded_stages": []}})
+        def send_and_unset(chat_id, text):
+            main.save_chats_config({})  # /unset пришёл, пока шла рассылка
+            return 1
+        with patch("main.fetch_raw_abl_games", return_value=[_game(5, 24)]), \
+             patch("main.send_msg", side_effect=send_and_unset):
+            main.monitor_tick()
+        self.assertEqual(main.load_chats_config(), {})
+
+    def test_old_stages_are_pruned(self):
+        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5,
+                                      "reminded_stages": ["1:announced", "1:24h", "5:announced"]}})
+        self._run_tick([_game(5, 100)])
+        self.assertEqual(main.load_chats_config()["1"]["reminded_stages"], ["5:announced"])
+
+    @patch("main.send_msg", return_value=1)
+    def test_set_same_team_keeps_reminder_state(self, _):
+        main.save_chats_config({"7": {"team": "БК Путилково", "division": "", "last_game_id": 5,
+                                      "reminded_stages": ["5:announced"]}})
+        main.process_message({"text": "/set БК Путилково", "chat": {"id": 7, "type": "private"}, "from": {"id": 1}})
+        self.assertEqual(main.load_chats_config()["7"]["reminded_stages"], ["5:announced"])
+        main.process_message({"text": "/set Другая", "chat": {"id": 7, "type": "private"}, "from": {"id": 1}})
+        self.assertEqual(main.load_chats_config()["7"]["reminded_stages"], [])
+
+    def test_corrupt_config_without_backup_is_preserved(self):
+        with open(main.CHATS_FILE, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        self.assertEqual(main.load_chats_config(), {})
+        self.assertTrue(any(n.startswith("chats.json.corrupt-") for n in os.listdir(self.test_dir)))
+
+    def test_backoff_never_overflows(self):
+        self.assertEqual(main._backoff(100000), main.MAX_BACKOFF_SEC)
+
+
+class TestSupervisorWatchdog(unittest.TestCase):
+    def test_stale_heartbeat_detected(self):
+        import supervisor, tempfile
+        d = tempfile.mkdtemp()
+        files = [os.path.join(d, "a"), os.path.join(d, "b")]
+        for f in files:
+            open(f, "w").close()
+        with patch.object(supervisor, "HEARTBEAT_FILES", files):
+            start = main.time.time() - 10000
+            self.assertIsNone(supervisor.heartbeat_stale(start))
+            old = main.time.time() - 1000
+            os.utime(files[0], (old, old))
+            self.assertIn("a", supervisor.heartbeat_stale(start))
+            # В период прогрева не убиваем
+            self.assertIsNone(supervisor.heartbeat_stale(main.time.time()))
 
 if __name__ == "__main__":
     unittest.main()

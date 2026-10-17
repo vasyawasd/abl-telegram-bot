@@ -5,3 +5,7 @@ chats.json
 chats.txt
 last_game_id.txt
 .env
+chats.json.*
+.bot.lock
+.bot.pid
+.heartbeat.*

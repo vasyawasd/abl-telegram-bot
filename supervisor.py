@@ -9,6 +9,14 @@ import atexit
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCK_FILE = os.path.join(SCRIPT_DIR, ".bot.lock")
 PID_FILE = os.path.join(SCRIPT_DIR, ".bot.pid")
+HEARTBEAT_FILES = [
+    os.path.join(SCRIPT_DIR, ".heartbeat.poll"),
+    os.path.join(SCRIPT_DIR, ".heartbeat.monitor"),
+]
+# Цикл опроса обновляет пульс минимум раз в ~60 сек (long-poll + backoff),
+# мониторинг — раз в 5 мин (+ до ~2 мин на рассылку). Берём с запасом.
+HEARTBEAT_LIMITS = [180, 900]
+STARTUP_GRACE_SEC = 120
 
 lock_file_handle = None
 
@@ -93,6 +101,41 @@ def handle_termination(sig, frame):
     release_single_instance_lock()
     sys.exit(0)
 
+def heartbeat_stale(start_time: float) -> str | None:
+    """Возвращает имя зависшего цикла, если его пульс давно не обновлялся."""
+    now = time.time()
+    if now - start_time < STARTUP_GRACE_SEC:
+        return None
+    for path, limit in zip(HEARTBEAT_FILES, HEARTBEAT_LIMITS):
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            age = now - start_time  # пульса нет с момента старта
+        if age > limit:
+            return f"{os.path.basename(path)} ({age:.0f} сек без обновления)"
+    return None
+
+def wait_with_watchdog(proc, start_time: float) -> int:
+    """Ждёт завершения бота; если цикл завис (не обновляет пульс) — убивает процесс."""
+    while True:
+        code = proc.poll()
+        if code is not None:
+            return code
+        stale = heartbeat_stale(start_time)
+        if stale:
+            print(f"🧊 [Supervisor] Бот завис: {stale}. Принудительный перезапуск...", flush=True)
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
+            return 1
+        time.sleep(10)
+
 def run_supervisor():
     global running, child_proc
     acquire_single_instance_lock()
@@ -112,9 +155,14 @@ def run_supervisor():
 
     while running:
         start_time = time.time()
+        for hb in HEARTBEAT_FILES:
+            try:
+                os.remove(hb)
+            except OSError:
+                pass
         try:
             child_proc = subprocess.Popen([sys.executable, main_script], cwd=SCRIPT_DIR)
-            exit_code = child_proc.wait()
+            exit_code = wait_with_watchdog(child_proc, start_time)
         except Exception as e:
             print(f"❌ [Supervisor] Ошибка запуска процесса бота: {e}")
             exit_code = 1
