@@ -874,5 +874,94 @@ class TestSupervisorWatchdog(unittest.TestCase):
             # В период прогрева не убиваем
             self.assertIsNone(supervisor.heartbeat_stale(main.time.time()))
 
+class TestPollFunctionality(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.test_dir = tempfile.mkdtemp()
+        self.orig_chats_file = main.CHATS_FILE
+        main.CHATS_FILE = os.path.join(self.test_dir, "chats.json")
+        self.sleep = patch("main.time.sleep").start()
+
+    def tearDown(self):
+        import shutil
+        patch.stopall()
+        main.CHATS_FILE = self.orig_chats_file
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    @patch("main.http_post")
+    def test_send_poll_payload(self, mock_post):
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"ok": True, "result": {"message_id": 991}}
+        mock_post.return_value = mock_resp
+
+        pid = main.send_poll("12345", "Игра vs ЦСКА: будешь?", ["Буду", "Не буду"], reply_to_message_id=55)
+        self.assertEqual(pid, 991)
+        mock_post.assert_called_once()
+        call_json = mock_post.call_args[1]["json"]
+        self.assertEqual(call_json["chat_id"], "12345")
+        self.assertEqual(call_json["question"], "Игра vs ЦСКА: будешь?")
+        self.assertEqual(call_json["options"], ["Буду", "Не буду"])
+        self.assertFalse(call_json["is_anonymous"])
+        self.assertFalse(call_json["allows_multiple_answers"])
+        self.assertEqual(call_json["reply_to_message_id"], 55)
+
+    @patch("main.send_poll", return_value=888)
+    @patch("main.send_msg", return_value=777)
+    def test_announcement_creates_poll_under_post(self, mock_send, mock_poll):
+        # При появлении нового расписания матча создаётся опрос под постом
+        main.save_chats_config({"100": {"team": "БК Путилково", "enabled": True, "reminded_stages": []}})
+        game = _game(42, 50, team="БК Путилково", opp="Спартак")
+
+        with patch("main.fetch_raw_abl_games", return_value=[game]):
+            ok = main.monitor_tick()
+
+        self.assertTrue(ok)
+        mock_send.assert_called_once()
+        self.assertIn("Новое расписание матча", mock_send.call_args[0][1])
+
+        mock_poll.assert_called_once()
+        poll_chat_id, poll_q = mock_poll.call_args[0][0], mock_poll.call_args[0][1]
+        self.assertEqual(poll_chat_id, "100")
+        self.assertIn("vs Спартак", poll_q)
+        self.assertIn("будешь", poll_q)
+        self.assertEqual(mock_poll.call_args[1]["reply_to_message_id"], 777)
+
+        cfg = main.load_chats_config()
+        stages = cfg["100"]["reminded_stages"]
+        self.assertIn("42:announced", stages)
+        self.assertIn("42:poll", stages)
+
+    @patch("main.send_poll", return_value=999)
+    @patch("main.fetch_raw_abl_games")
+    def test_poll_command_creates_poll(self, mock_fetch, mock_poll):
+        game = _game(10, 20, team="БК Путилково", opp="Метеор")
+        mock_fetch.return_value = [game]
+
+        main.save_chats_config({"200": {"team": "БК Путилково", "enabled": True}})
+        msg = {
+            "text": "/poll",
+            "chat": {"id": 200, "type": "private"},
+            "from": {"id": 1},
+            "message_id": 50
+        }
+        main.process_message(msg)
+        mock_poll.assert_called_once()
+        self.assertIn("vs Метеор", mock_poll.call_args[0][1])
+
+    @patch("main.send_msg")
+    @patch("main.is_group_admin", return_value=False)
+    def test_poll_command_non_admin_rejected_in_group(self, mock_admin, mock_send):
+        main.save_chats_config({"-100555": {"team": "БК Путилково", "enabled": True}})
+        msg = {
+            "text": "/poll",
+            "chat": {"id": -100555, "type": "group"},
+            "from": {"id": 99},
+            "message_id": 70
+        }
+        main.process_message(msg)
+        mock_send.assert_called_once()
+        self.assertIn("Только администратор", mock_send.call_args[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -642,6 +642,80 @@ def send_msg(chat_id: int | str, text: str) -> int | None:
                 safe_print(f"⚠️ Сбой сети при отправке в чат {chat_id} ({attempt} попыток): {e}")
     return None
 
+DEFAULT_POLL_OPTIONS = ["Буду", "Не буду", "Под вопросом"]
+
+def build_poll_question(g: dict, is_left: bool) -> str:
+    """Формирует вопрос для опроса посещаемости матча."""
+    t1 = (g.get("team") or {}).get("name") or ""
+    t2 = (g.get("competitor_team") or {}).get("name") or ""
+    opp = t2 if is_left else t1
+    dt = parse_game_dt(g)
+    msk_str = dt.astimezone(MOSCOW_TZ).strftime('%d.%m в %H:%M') if dt else ""
+    date_part = f" ({msk_str})" if msk_str else ""
+    opp_part = f" vs {opp}" if opp else ""
+    q = f"🏀 Игра{opp_part}{date_part}: будешь?"
+    return q[:300]
+
+def send_poll(chat_id: int | str, question: str, options: list[str] = None, reply_to_message_id: int | None = None) -> int | None:
+    """Отправляет публичный опрос (неанонимный) в чат с повторами при сбоях (429, 5xx, сбои сети).
+    Возвращает message_id или None."""
+    if options is None:
+        options = DEFAULT_POLL_OPTIONS
+    attempt = 0
+    payload = {
+        "chat_id": chat_id,
+        "question": question[:300],
+        "options": list(options),
+        "is_anonymous": False,
+        "allows_multiple_answers": False,
+    }
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = int(reply_to_message_id)
+
+    while attempt < SEND_ATTEMPTS:
+        attempt += 1
+        try:
+            r = http_post(
+                f"https://api.telegram.org/bot{TOKEN}/sendPoll",
+                json=payload,
+                timeout=TG_TIMEOUT
+            )
+            if r.status_code == 429:
+                try:
+                    retry_after = int(r.json().get("parameters", {}).get("retry_after", 5))
+                except Exception:
+                    retry_after = 5
+                safe_print(f"⚠️ Telegram 429 в send_poll. Ожидание {retry_after + 1} сек...")
+                time.sleep(min(retry_after, 60) + 1.0)
+                continue
+
+            if isinstance(r.status_code, int) and r.status_code >= 500:
+                raise requests.exceptions.HTTPError(f"Telegram HTTP {r.status_code}")
+
+            res = r.json()
+            if res.get("ok"):
+                return res["result"]["message_id"]
+
+            err_code = res.get("error_code")
+            err_desc = (res.get("description") or "").lower()
+            if err_code == 403 or "kicked" in err_desc or "deactivated" in err_desc or "chat not found" in err_desc:
+                disable_chat(chat_id, err_desc)
+                return None
+
+            if "reply_to_message_id" in payload:
+                del payload["reply_to_message_id"]
+                attempt -= 1
+                continue
+
+            safe_print(f"⚠️ Telegram отклонил опрос в чат {chat_id}: {err_desc}")
+            return None
+        except (requests.RequestException, ValueError) as e:
+            if attempt < SEND_ATTEMPTS:
+                time.sleep(2.0 * attempt)
+            else:
+                safe_print(f"⚠️ Сбой сети при отправке опроса в чат {chat_id} ({attempt} попыток): {e}")
+    return None
+
 def delete_msg(chat_id: int | str, message_id: int):
     try:
         r = http_post(
@@ -784,9 +858,17 @@ def monitor_tick(now_utc: datetime | None = None) -> bool:
             ann_key = f"{gid_n}:announced"
             if gid_n and gid_n != info.get("last_game_id") and ann_key not in stages:
                 card = format_game_card(g_n, is_left_n, "Новое расписание матча!")
-                if send_msg(s_chat_id, f"⚡️ *Новое расписание матча!*\n\n{card}"):
+                ann_mid = send_msg(s_chat_id, f"⚡️ *Новое расписание матча!*\n\n{card}")
+                if ann_mid:
                     _mark_sent(s_chat_id, team, [ann_key], last_game_id=gid_n)
                     stages.append(ann_key)
+                    # Опрос «буду / не буду» под первым постом с объявлением
+                    poll_q = build_poll_question(g_n, is_left_n)
+                    poll_mid = send_poll(s_chat_id, poll_q, reply_to_message_id=ann_mid)
+                    if poll_mid:
+                        poll_key = f"{gid_n}:poll"
+                        _mark_sent(s_chat_id, team, [poll_key])
+                        stages.append(poll_key)
 
             # 2. Двухуровневый отложенный механизм напоминаний
             for dt, g, is_left, _, _ in upcoming:
@@ -892,6 +974,7 @@ def process_message(msg: dict):
                     "• Нажмите `/game` — узнать ближайшую игру, зал и цвет формы.\n"
                     "• `/game НазваниеКоманды` — проверить любую команду лиги.\n"
                     "• `/schedule` — календарь матчей команды.\n"
+                    "• `/poll` — опрос на игру (буду / не буду).\n"
                     "• `/set НазваниеКоманды` — привязать другую команду к этому диалогу.\n\n"
                     "👥 *Для добавления в группу:*\n"
                     "Добавьте бота в чат команды. Администратор может отправить `/set Название Команды`, "
@@ -991,6 +1074,45 @@ def process_message(msg: dict):
 
             _, reply = fetch_next_game(team_query, division_query)
             send_msg(chat_id, reply)
+            return
+
+        # --- 3.1 ОПРОС НА ИГРУ (БУДУ / НЕ БУДУ) ---
+        if cmd in ["/poll", "/опрос"]:
+            if not is_private and not is_channel and not is_anon_admin and not is_group_admin(chat_id, user_id):
+                w_id = send_msg(chat_id, "⛔️ Только администратор этой группы может создавать опрос.")
+                delete_later(chat_id, [w_id, msg.get("message_id")], delay=1.5)
+                return
+
+            team_query = args
+            division_query = ""
+            if team_query:
+                team_query, division_query = parse_team_and_division(team_query)
+            elif chat_id in cfg and cfg[chat_id].get("team"):
+                cfg_team = cfg[chat_id]["team"]
+                cfg_div = cfg[chat_id].get("division", "")
+                team_query, division_query = parse_team_and_division(cfg_team)
+                if not division_query:
+                    division_query = cfg_div
+            else:
+                team_query = DEFAULT_TEAM
+
+            game_id, card_or_err = fetch_next_game(team_query, division_query)
+            if not game_id:
+                send_msg(chat_id, card_or_err)
+                return
+
+            raw_games = fetch_raw_abl_games(fallback_to_cache=True) or []
+            g_match = next((g for g in raw_games if isinstance(g, dict) and g.get("id") == game_id), None)
+            if g_match:
+                t1 = (g_match.get("team") or {}).get("name") or ""
+                is_left = match_text(team_query, t1)
+                poll_q = build_poll_question(g_match, is_left)
+            else:
+                poll_q = f"🏀 Игра {team_query}: будешь?"
+
+            p_id = send_poll(chat_id, poll_q, reply_to_message_id=msg.get("message_id"))
+            if not p_id:
+                send_msg(chat_id, "⚠️ Не удалось создать опрос. Попробуйте позже.")
             return
 
         # --- 4. КАЛЕНДАРЬ НА СЕЗОН ---
