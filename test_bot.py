@@ -781,6 +781,7 @@ class TestReliability(unittest.TestCase):
 
     def _run_tick(self, games, send_ret=1):
         with patch("main.fetch_raw_abl_games", return_value=games), \
+             patch("main.send_poll", return_value=2), \
              patch("main.send_msg", return_value=send_ret) as ms:
             ok = main.monitor_tick()
         return ok, ms
@@ -800,6 +801,7 @@ class TestReliability(unittest.TestCase):
         self.assertEqual(ms.call_count, 1)
         # Час спустя та же игра: ни 3ч, ни запоздалое 24ч повторно не отправляются
         with patch("main.fetch_raw_abl_games", return_value=games), \
+             patch("main.send_poll", return_value=2), \
              patch("main.send_msg", return_value=1) as ms2:
             main.monitor_tick(datetime.now(timezone.utc) + timedelta(hours=1))
         ms2.assert_not_called()
@@ -829,6 +831,7 @@ class TestReliability(unittest.TestCase):
             main.save_chats_config({})  # /unset пришёл, пока шла рассылка
             return 1
         with patch("main.fetch_raw_abl_games", return_value=[_game(5, 24)]), \
+             patch("main.send_poll", return_value=2), \
              patch("main.send_msg", side_effect=send_and_unset):
             main.monitor_tick()
         self.assertEqual(main.load_chats_config(), {})
@@ -948,9 +951,10 @@ class TestPollFunctionality(unittest.TestCase):
         mock_poll.assert_called_once()
         self.assertIn("vs Метеор", mock_poll.call_args[0][1])
 
-    @patch("main.send_msg")
+    @patch("main.send_msg", return_value=555)
+    @patch("main.delete_later")
     @patch("main.is_group_admin", return_value=False)
-    def test_poll_command_non_admin_rejected_in_group(self, mock_admin, mock_send):
+    def test_poll_command_non_admin_rejected_in_group(self, mock_admin, mock_delete, mock_send):
         main.save_chats_config({"-100555": {"team": "БК Путилково", "enabled": True}})
         msg = {
             "text": "/poll",
@@ -961,6 +965,7 @@ class TestPollFunctionality(unittest.TestCase):
         main.process_message(msg)
         mock_send.assert_called_once()
         self.assertIn("Только администратор", mock_send.call_args[0][1])
+        mock_delete.assert_called_once_with("-100555", [555, 70], delay=1.5)
 
 
 if __name__ == "__main__":
