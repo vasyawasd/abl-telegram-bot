@@ -6,6 +6,7 @@ import time
 import socket
 import requests
 import threading
+import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from requests.adapters import HTTPAdapter
@@ -580,6 +581,129 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
 
     return "\n".join(lines)
 
+def format_scout_report(team: dict, tournament: dict, rows: list, game_date=None) -> str:
+    """Показатели за завершённые матчи выбранного турнира, а не за карьеру."""
+    players = []
+    fields = ("points", "rebounds", "assists", "steals", "blocks", "three_points_made", "three_point_attempts")
+    for row in rows:
+        member = row["tournament_team_user"]
+        if row["team_id"] != team["id"] or member["tournament_team"]["tournament_id"] != tournament["id"]:
+            raise ValueError("Статистика другой команды или турнира")
+        games = int(row["games_count"])
+        if games <= 0:
+            continue
+        totals = {key: float(row[key]) for key in fields}
+        if any(not math.isfinite(value) or value < 0 for value in totals.values()):
+            raise ValueError("Некорректные показатели игрока")
+        person = member.get("league_player") or {}
+        name = " ".join(str(person.get(key) or "") for key in ("last_name", "first_name")).strip()[:60] or "Игрок"
+        number = (member.get("team_user") or {}).get("number")
+        label = f"№{str(number)[:8] if number is not None else '?'} {name}"
+        players.append({"label": label, "games": games, "totals": totals,
+                        **{key: value / games for key, value in totals.items()}})
+
+    lines = [f"🔎 *Скаутинг: {str(team['name'])[:100]}*",
+             f"🏆 Турнир: {str(tournament.get('name') or 'ABL')[:100]}"]
+    if game_date:
+        lines.append(f"📅 Ближайшая игра: {game_date.astimezone(MOSCOW_TZ).strftime('%d.%m.%Y в %H:%M')} МСК")
+    if not players:
+        return "\n".join(lines) + "\n\nПока нет индивидуальной статистики завершённых матчей этого турнира."
+
+    players.sort(key=lambda p: (-p["points"], -p["games"], p["label"]))
+    lines.append("\n*Игроки по очкам за матч (до 8):*\nОчки, подборы, передачи — в среднем; 3-очковые — всего.")
+    for p in players[:8]:
+        made, attempts = p["totals"]["three_points_made"], p["totals"]["three_point_attempts"]
+        shots = f"{made:g}/{attempts:g} ({made / attempts:.0%})" if attempts else "нет попыток"
+        lines.append(f"• {p['label']} — {p['points']:.1f} оч · {p['rebounds']:.1f} подб · {p['assists']:.1f} пас ({p['games']} игр.)\n"
+                     f"  3-очк: {shots}; перехв {p['steals']:.1f} · блок {p['blocks']:.1f}")
+    lines.append("\n*Акценты по статистике:*")
+    for field, title in (("rebounds", "Подборы"), ("assists", "Передачи"), ("three_points_made", "Попадания из-за дуги")):
+        leader = max(players, key=lambda p: p[field])
+        if leader[field] > 0:
+            lines.append(f"• {title}: {leader['label']} — {leader[field]:.1f} за матч.")
+    if max(p["games"] for p in players) < 3:
+        lines.append("\nМало данных: у игроков меньше 3 матчей в этом турнире.")
+    return "\n".join(lines)
+
+
+def _scout_named_team(team_name: str) -> tuple | str:
+    """Ищет команду в каталоге последнего сезона, независимо от расписания чата."""
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"}
+    seasons, _ = _fetch_abl_page(f"https://mtgame.ru/api/v1/league/{LEAGUE_ID}/tournament_seasons/?not_closed=1&size=100", headers)
+    if not seasons:
+        return "В ABL пока нет доступного сезона."
+    # API возвращает сезоны от нового к старому; старые тоже могут иметь status=open.
+    season_id = int(seasons[0]["id"])
+    catalog, _ = _fetch_abl_page(f"https://mtgame.ru/api/v1/tournament_season/{season_id}/teams/?short=1", headers)
+    teams = {row["team"]["id"]: row["team"] for row in catalog}
+    # Точное каноническое имя важнее частичного совпадения и турнирных псевдонимов:
+    # HDXСЕВЕР и HDxSEVER WOMEN — разные команды, даже если у второй псевдоним HDxSEVER.
+    exact = [t for t in teams.values() if clean_homo(team_name) == clean_homo(t["name"])
+             or clean_alnum(translit_ru(team_name)) == clean_alnum(translit_ru(t["name"]))]
+    matches = exact or [t for t in teams.values() if match_text(team_name, t["name"])]
+    if not matches:
+        return f"Команда {team_name[:100]} не найдена в каталоге текущего сезона ABL. Уточните название."
+    if len(matches) > 1:
+        names = ", ".join(t["name"][:80] for t in matches[:8])
+        return f"Найдено несколько команд: {names}. Укажите более точное название после /scout."
+    team = matches[0]
+    memberships, _ = _fetch_abl_page(f"https://mtgame.ru/api/v1/team/{int(team['id'])}/tournament_teams/", headers)
+    allowed = {row["tournament_id"] for row in catalog if row["team"]["id"] == team["id"]}
+    tournaments = [row["tournament"] for row in memberships if row["tournament"]["id"] in allowed]
+    if not tournaments:
+        return f"Для команды {team['name'][:100]} пока нет турнира в текущем сезоне."
+    tournament = max(tournaments, key=lambda t: (t.get("date") or "", t["id"]))
+    return team, tournament
+
+
+def fetch_scout(team_name: str, direct: bool = False) -> str:
+    team_name, _ = parse_team_and_division(team_name)
+    if not team_name:
+        return "Укажите название команды после /scout."
+    try:
+        dt = None
+        if direct:
+            target = _scout_named_team(team_name)
+            if isinstance(target, str):
+                return target
+            team, tournament = target
+        else:
+            raw = fetch_raw_abl_games()
+            if raw is None:
+                return "⚠️ Не удалось получить расписание ABL. Попробуйте позже."
+            upcoming = _team_upcoming(raw, team_name, "", datetime.now(timezone.utc))
+            if not upcoming:
+                return f"Пока нет назначенной ближайшей игры для команды {team_name[:100]}."
+            dt, game, is_left, _, _ = upcoming[0]
+            team = game.get("competitor_team" if is_left else "team") or {}
+            tournament = game.get("tournament") or {}
+        team_id, tournament_id = int(team["id"]), int(tournament["id"])
+        rows = []
+        # ponytail: 1000 строк с запасом для состава; не выдаём обрезанный отчёт при сбое пагинации.
+        for page in range(1, 11):
+            response = http_post("https://mtgame.ru/api/v1/basketball_statistic/",
+                                 json={"group_by": "tournament_team_user", "tournament_ids": str(tournament_id),
+                                       "team_id": team_id, "per_game": "0", "only_closed": "1", "page": page, "size": 100},
+                                 headers={"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"},
+                                 timeout=ABL_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, list):
+                raise ValueError("Неожиданный формат статистики")
+            rows.extend(data)
+            total = int(response.headers.get("X-Page-Count", len(rows)))
+            if len(rows) >= total:
+                break
+            if not data:
+                raise ValueError("Неполная статистика")
+        else:
+            raise ValueError("Слишком много страниц статистики")
+        return format_scout_report(team, tournament, rows, dt)
+    except (requests.RequestException, ValueError, TypeError, KeyError, AttributeError, OverflowError) as e:
+        safe_print(f"⚠️ Ошибка получения статистики ABL: {e}")
+        return "⚠️ Не удалось получить статистику ABL. Попробуйте позже."
+
+
 SEND_ATTEMPTS = 3
 
 def send_msg(chat_id: int | str, text: str) -> int | None:
@@ -921,6 +1045,8 @@ def process_message(msg: dict):
                     f"🏀 По умолчанию настроен на команду: *{DEFAULT_TEAM}*\n\n"
                     "• Нажмите `/game` — узнать ближайшую игру, зал и цвет формы.\n"
                     "• `/game НазваниеКоманды` — проверить любую команду лиги.\n"
+                    "• `/scout` или `/скаут` — разбор ближайшего соперника.\n"
+                    "• `/scout Команда` — статистика указанной команды.\n"
                     "• `/schedule` — календарь матчей команды.\n"
                     "• `/poll` — опрос на игру (буду / не буду).\n"
                     "• `/set НазваниеКоманды` — привязать другую команду к этому диалогу.\n\n"
@@ -931,11 +1057,13 @@ def process_message(msg: dict):
             else:
                 if chat_id in cfg and cfg[chat_id].get("team"):
                     info = cfg[chat_id]
-                    send_msg(chat_id, f"🏀 Этот чат настроен на команду: *{info['team']}*.\nДивизион определяется по расписанию лиги.\nИспользуйте команду `/game` для просмотра ближайшей игры.")
+                    send_msg(chat_id, f"🏀 Этот чат настроен на команду: *{info['team']}*.\nДивизион определяется по расписанию лиги.\nИспользуйте команду `/game` для просмотра ближайшей игры.\n`/scout` или `/скаут` — разбор ближайшего соперника, доступен всем участникам.\n`/scout Команда` — статистика указанной команды.")
                 else:
                     send_msg(chat_id, (
                         f"👋 Привет! В этой группе пока не настроена отдельная команда.\n"
                         f"• Напишите `/game` — покажет ближайшую игру команды *{DEFAULT_TEAM}*.\n"
+                        "• `/scout` или `/скаут` — разбор её ближайшего соперника.\n"
+                        "• `/scout Команда` — статистика указанной команды.\n"
                         f"• Чтобы закрепить за группой вашу команду, администратор должен отправить:\n"
                         f"`/set Название Команды`"
                     ))
@@ -1000,6 +1128,12 @@ def process_message(msg: dict):
             return
 
         # --- 3. ЗАПРОС РАСПИСАНИЯ ИГРОКАМИ (ДОСТУПНО ВСЕМ) ---
+        if cmd in ["/scout", "/скаут"]:
+            team_query = args or cfg.get(chat_id, {}).get("team") or DEFAULT_TEAM
+            team_query, _ = parse_team_and_division(team_query)
+            send_msg(chat_id, fetch_scout(team_query or DEFAULT_TEAM, direct=bool(args)))
+            return
+
         if cmd in ["/game", "/next", "/abl"]:
             team_query = args
             division_query = ""
