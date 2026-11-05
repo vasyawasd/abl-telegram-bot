@@ -454,9 +454,9 @@ def format_game_card(g: dict, is_left: bool, title: str = "Расписание 
     )
 
 def fetch_next_game(team_name: str, division_name: str = ""):
-    parsed_team, parsed_div = parse_team_and_division(team_name)
+    # ponytail: старые аргументы принимаем, но следим за командой между этапами сезона.
+    parsed_team, _ = parse_team_and_division(team_name)
     team_name = parsed_team or team_name
-    division_name = division_name or parsed_div
 
     if not team_name:
         return None, "⚠️ Пожалуйста, укажите название команды: `/game НазваниеКоманды`"
@@ -475,13 +475,10 @@ def fetch_next_game(team_name: str, division_name: str = ""):
             continue
         t1 = (g.get("team") or {}).get("name") or ""
         t2 = (g.get("competitor_team") or {}).get("name") or ""
-        tourn_name = (g.get("tournament") or {}).get("name") or ""
-
         is_left = match_text(team_name, t1)
         is_right = match_text(team_name, t2)
-        div_match = not division_name or match_text(division_name, tourn_name)
 
-        if (is_left or is_right) and div_match:
+        if is_left or is_right:
             dt_str = g.get("datetime")
             if dt_str:
                 try:
@@ -494,8 +491,7 @@ def fetch_next_game(team_name: str, division_name: str = ""):
                     pass
 
     if not upcoming:
-        div_hint = f" ({division_name})" if division_name else ""
-        return None, f"Пока нет открытых назначенных игр для команды *{team_name}*{div_hint}."
+        return None, f"Пока нет открытых назначенных игр для команды *{team_name}*."
 
     upcoming.sort(key=lambda x: x[0])
     dt, g, is_left, t1, t2 = upcoming[0]
@@ -522,9 +518,8 @@ def fetch_next_game(team_name: str, division_name: str = ""):
     return g.get("id"), text
 
 def fetch_schedule(team_name: str, division_name: str = "") -> str:
-    parsed_team, parsed_div = parse_team_and_division(team_name)
+    parsed_team, _ = parse_team_and_division(team_name)
     team_name = parsed_team or team_name
-    division_name = division_name or parsed_div
 
     if not team_name:
         return "⚠️ Пожалуйста, укажите название команды: `/schedule НазваниеКоманды`"
@@ -542,13 +537,10 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
             continue
         t1 = (g.get("team") or {}).get("name") or ""
         t2 = (g.get("competitor_team") or {}).get("name") or ""
-        tourn_name = (g.get("tournament") or {}).get("name") or ""
-
         is_left = match_text(team_name, t1)
         is_right = match_text(team_name, t2)
-        div_match = not division_name or match_text(division_name, tourn_name)
 
-        if (is_left or is_right) and div_match:
+        if is_left or is_right:
             dt_str = g.get("datetime")
             dt = min_dt
             if dt_str:
@@ -561,8 +553,7 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
             team_games.append((dt, g, is_left, t1, t2))
 
     if not team_games:
-        div_hint = f" ({division_name})" if division_name else ""
-        return f"Игр для команды *{team_name}*{div_hint} не найдено."
+        return f"Игр для команды *{team_name}* не найдено."
 
     team_games.sort(key=lambda x: (x[0] == min_dt, x[0]))
     upcoming = [x for x in team_games if x[1].get("status") == "open" and (x[0] >= now or x[0] == min_dt)]
@@ -576,8 +567,9 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
             opp = t2 if is_left else t1
             form = "⚪️ СВЕТЛАЯ" if is_left else "⚫️ ЧЁРНАЯ"
             court = (g.get("tournament_court") or {}).get("name") or g.get("location") or "Зал уточняется"
+            division = (g.get("tournament") or {}).get("name") or "ABL"
             time_display = msk_dt.strftime('%d.%m в %H:%M') if dt > datetime(2000, 1, 1, tzinfo=timezone.utc) else "Дата уточняется"
-            lines.append(f"• *{time_display}* — vs {opp} ({form}) | {court}")
+            lines.append(f"• *{time_display}* — vs {opp} ({form}) | {division} | {court}")
 
     if finished:
         lines.append("\n*🏁 Завершённые матчи:*")
@@ -765,42 +757,26 @@ def delete_later(chat_id: int | str, message_ids: list, delay: float = 3.0):
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def _stage_key(gid, dt: datetime, stage: str) -> str:
-    return f"{gid}:{dt.strftime('%Y%m%d%H%M')}:{stage}"
-
-def _stage_done(stages: list, gid, dt: datetime, stage: str) -> bool:
-    # Ключ включает время матча: при переносе игры напоминание придёт заново.
-    # Старый формат "gid:stage" (до обновления) тоже считается выполненным.
-    return _stage_key(gid, dt, stage) in stages or f"{gid}:{stage}" in stages
-
-def _mark_sent(chat_id: str, team: str, keys: list, last_game_id=None) -> bool:
+def _mark_sent(chat_id: str, team: str, keys: list, last_game_id=None, announcement_message_id=None) -> bool:
     """Фиксирует отправку сразу после неё, перечитывая свежий конфиг.
     Если за время отправки чат отвязали или сменили команду — ничего не пишем."""
     def _mut(info):
         if info.get("team") != team or info.get("enabled") is False:
             return False
         stages = info.setdefault("reminded_stages", [])
+        # Сохраняем старую отметку до замены last_game_id следующим матчем.
+        old_gid = info.get("last_game_id")
+        if old_gid is not None and f"{old_gid}:announced" not in stages:
+            stages.append(f"{old_gid}:announced")
         for k in keys:
             if k not in stages:
                 stages.append(k)
         if last_game_id is not None:
             info["last_game_id"] = last_game_id
+        if announcement_message_id is not None:
+            info.setdefault("announcement_message_ids", {})[str(last_game_id)] = announcement_message_id
         return True
     return update_chat(chat_id, _mut)
-
-def _prune_stages(chat_id: str, team: str, keep_gids: set):
-    """Удаляет отметки о прошедших/снятых играх, чтобы chats.json не рос бесконечно."""
-    keep = {str(g) for g in keep_gids}
-    def _mut(info):
-        if info.get("team") != team:
-            return False
-        stages = info.get("reminded_stages") or []
-        kept = [s for s in stages if str(s).split(":", 1)[0] in keep]
-        if len(kept) != len(stages):
-            info["reminded_stages"] = kept
-            return True
-        return False
-    update_chat(chat_id, _mut)
 
 def _team_upcoming(raw_games: list, team: str, division: str, now_utc: datetime) -> list:
     upcoming = []
@@ -809,23 +785,15 @@ def _team_upcoming(raw_games: list, team: str, division: str, now_utc: datetime)
             continue
         t1 = (g.get("team") or {}).get("name") or ""
         t2 = (g.get("competitor_team") or {}).get("name") or ""
-        tourn = (g.get("tournament") or {}).get("name") or ""
         is_left = match_text(team, t1)
         is_right = match_text(team, t2)
-        div_match = not division or match_text(division, tourn)
-        if (is_left or is_right) and div_match:
+        if is_left or is_right:
             dt = parse_game_dt(g)
             if dt and dt >= now_utc:
                 upcoming.append((dt, g, is_left, t1, t2))
     upcoming.sort(key=lambda x: x[0])
     return upcoming
 
-# Окна напоминаний (в часах до начала). Окна сшиты встык, поэтому простой бота
-# или API не приводит к пропуску: пропущенное «за 24ч» догоняется вплоть до 6ч до игры,
-# а «за 3ч» отправляется вплоть до начала игры.
-REMIND_24H_MAX = 30.0
-REMIND_24H_MIN = 6.0
-REMIND_3H_MAX = 3.5
 MONITOR_RETRY_SEC = 60  # повторная проверка после сбоя API
 
 def monitor_tick(now_utc: datetime | None = None) -> bool:
@@ -845,64 +813,44 @@ def monitor_tick(now_utc: datetime | None = None) -> bool:
             if not team:
                 continue
             division = info.get("division", "")
-            stages = list(info.get("reminded_stages") or [])
-
+            stages = set(info.get("reminded_stages") or [])
+            if info.get("last_game_id") is not None:
+                stages.add(f"{info['last_game_id']}:announced")
+            announcement_ids = info.get("announcement_message_ids") or {}
+            # ponytail: храним отметки без срока; чистка требует подтверждённого архива игр.
             upcoming = _team_upcoming(raw_games, team, division, now_utc)
-            _prune_stages(s_chat_id, team, {g.get("id") for _, g, *_ in upcoming if g.get("id")})
-            if not upcoming:
-                continue
-
-            # 1. Анонс нового назначенного матча
-            _, g_n, is_left_n, _, _ = upcoming[0]
-            gid_n = g_n.get("id")
-            ann_key = f"{gid_n}:announced"
-            if gid_n and gid_n != info.get("last_game_id") and ann_key not in stages:
-                card = format_game_card(g_n, is_left_n, "Новое расписание матча!")
-                ann_mid = send_msg(s_chat_id, f"⚡️ *Новое расписание матча!*\n\n{card}")
-                if ann_mid:
-                    _mark_sent(s_chat_id, team, [ann_key], last_game_id=gid_n)
-                    stages.append(ann_key)
-                    # Опрос «буду / не буду» под первым постом с объявлением
-                    poll_q = build_poll_question(g_n, is_left_n)
-                    poll_mid = send_poll(s_chat_id, poll_q, reply_to_message_id=ann_mid)
-                    if poll_mid:
-                        poll_key = f"{gid_n}:poll"
-                        _mark_sent(s_chat_id, team, [poll_key])
-                        stages.append(poll_key)
-
-            # 2. Двухуровневый отложенный механизм напоминаний
-            for dt, g, is_left, _, _ in upcoming:
+            for _, g, is_left, _, _ in upcoming:
                 gid = g.get("id")
                 if not gid:
                     continue
-                hours = (dt - now_utc).total_seconds() / 3600.0
+                ann_key = f"{gid}:announced"
+                ann_mid = announcement_ids.get(str(gid))
+                if ann_key not in stages:
+                    card = format_game_card(g, is_left, "Новое расписание матча!")
+                    ann_mid = send_msg(s_chat_id, f"⚡️ *Новое расписание матча!*\n\n{card}")
+                    if not ann_mid:
+                        continue
+                    if not _mark_sent(s_chat_id, team, [ann_key], last_game_id=gid,
+                                      announcement_message_id=ann_mid):
+                        break
+                    stages.add(ann_key)
+                    announcement_ids[str(gid)] = ann_mid
 
-                if REMIND_24H_MIN < hours <= REMIND_24H_MAX and not _stage_done(stages, gid, dt, "24h"):
-                    # После простоя 24ч-напоминание может догонять, когда игра уже сегодня
-                    is_today = dt.astimezone(MOSCOW_TZ).date() == now_utc.astimezone(MOSCOW_TZ).date()
-                    day_word = "Сегодня" if is_today else "Завтра"
-                    card = format_game_card(g, is_left, f"Напоминание: матч {day_word.lower()}!")
-                    if send_msg(s_chat_id, f"🔔 *Внимание! {day_word} игра:*\n\n{card}"):
-                        key = _stage_key(gid, dt, "24h")
-                        _mark_sent(s_chat_id, team, [key])
-                        stages.append(key)
-
-                elif 0 < hours <= REMIND_3H_MAX and not _stage_done(stages, gid, dt, "3h"):
-                    card = format_game_card(g, is_left, "Внимание! До игры осталось 3 часа!")
-                    if send_msg(s_chat_id, f"🔥 *Матч уже скоро!*\n\n{card}"):
-                        # Если «за 24ч» так и не ушло, оно уже неактуально — помечаем оба
-                        keys = [_stage_key(gid, dt, "3h"), _stage_key(gid, dt, "24h")]
-                        _mark_sent(s_chat_id, team, keys)
-                        stages.extend(keys)
+                # Неудачный опрос повторяется отдельно, включая запуск после перезапуска.
+                poll_key = f"{gid}:poll"
+                if poll_key not in stages:
+                    poll_q = build_poll_question(g, is_left)
+                    if send_poll(s_chat_id, poll_q, reply_to_message_id=ann_mid):
+                        if not _mark_sent(s_chat_id, team, [poll_key]):
+                            break
+                        stages.add(poll_key)
         except Exception as e:
             # Сбой в одном чате не должен останавливать рассылку остальным
             safe_print(f"⚠️ Ошибка мониторинга чата {s_chat_id}: {e}")
     return True
 
 def auto_monitor_loop():
-    """Фоновый мониторинг:
-    1. Оповещает о появлении нового расписания матча.
-    2. Надежный отложенный механизм напоминаний: за 24 часа и за 3 часа до игры."""
+    """Публикует один анонс с опросом для каждого нового назначенного матча."""
     time.sleep(5)
     while True:
         touch_heartbeat(MONITOR_HEARTBEAT_FILE)
@@ -983,8 +931,7 @@ def process_message(msg: dict):
             else:
                 if chat_id in cfg and cfg[chat_id].get("team"):
                     info = cfg[chat_id]
-                    div_s = f" ({info['division']})" if info.get('division') else ""
-                    send_msg(chat_id, f"🏀 Этот чат настроен на команду: *{info['team']}*{div_s}.\nИспользуйте команду `/game` для просмотра ближайшей игры.")
+                    send_msg(chat_id, f"🏀 Этот чат настроен на команду: *{info['team']}*.\nДивизион определяется по расписанию лиги.\nИспользуйте команду `/game` для просмотра ближайшей игры.")
                 else:
                     send_msg(chat_id, (
                         f"👋 Привет! В этой группе пока не настроена отдельная команда.\n"
@@ -1002,10 +949,10 @@ def process_message(msg: dict):
                 return
 
             if not args:
-                send_msg(chat_id, "Укажите команду:\n`/set Название Команды`\nили с дивизионом:\n`/set Название Команды | Дивизион`")
+                send_msg(chat_id, "Укажите команду:\n`/set Название Команды`\nДивизион определяется по расписанию лиги.")
                 return
 
-            team, division = parse_team_and_division(args)
+            team, _ = parse_team_and_division(args)
 
             if not team:
                 send_msg(chat_id, "Укажите корректное название команды.")
@@ -1014,21 +961,21 @@ def process_message(msg: dict):
             with CONFIG_LOCK:
                 cfg = load_chats_config()
                 old = cfg.get(chat_id) if isinstance(cfg.get(chat_id), dict) else {}
-                same = old.get("team") == team and old.get("division", "") == division
-                # Повторный /set той же команды не должен заново слать уже отправленные напоминания
+                same = old.get("team") == team
+                # Повторный /set той же команды сохраняет отправленные анонсы и опросы.
                 cfg[chat_id] = {
                     "team": team,
-                    "division": division,
                     "enabled": True,
                     "last_game_id": old.get("last_game_id") if same else None,
                     "reminded_stages": list(old.get("reminded_stages") or []) if same else [],
+                    "announcement_message_ids": dict(old.get("announcement_message_ids") or {}) if same else {},
                 }
                 save_chats_config(cfg)
 
-            div_label = f", дивизион: *{division}*" if division else ""
             send_msg(chat_id, (
                 f"✅ Чат успешно привязан!\n\n"
-                f"🏀 Команда: *{team}*{div_label}\n\n"
+                f"🏀 Команда: *{team}*\n\n"
+                f"• Дивизион определяется по расписанию лиги.\n"
                 f"• Расписание и цвет формы будут приходить сюда автоматически.\n"
                 f"• В любой момент можно написать `/game`, чтобы освежить информацию."
             ))

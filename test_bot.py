@@ -406,10 +406,11 @@ class TestAblBot(unittest.TestCase):
         main.process_message(msg)
         self.assertIn("-100555", self.mock_config)
         self.assertEqual(self.mock_config["-100555"]["team"], "Химки")
-        self.assertEqual(self.mock_config["-100555"]["division"], "Первый дивизион")
+        self.assertNotIn("division", self.mock_config["-100555"])
 
     @patch("main.send_msg")
-    def test_sender_chat_none_does_not_crash(self, mock_send):
+    @patch("main.fetch_next_game", return_value=(None, "Нет ближайших игр"))
+    def test_sender_chat_none_does_not_crash(self, mock_fetch, mock_send):
         # Критичный тест: sender_chat: None не должен вызывать AttributeError
         msg = {
             "message_id": 100,
@@ -629,70 +630,19 @@ class TestAblResilience(unittest.TestCase):
         cfg = main.load_chats_config()
         self.assertFalse(cfg["99999"]["enabled"])
 
+    @patch("main.send_poll")
     @patch("main.send_msg")
-    def test_reminder_stages_24h_and_3h_idempotent(self, mock_send):
-        mock_send.return_value = 1001
-        now = datetime.now(timezone.utc)
-
-        # 1 матч через 24 часа, 1 матч через 2 часа
-        dt_24h = (now + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        dt_3h = (now + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        fake_games = [
-            {
-                "id": 1001,
-                "status": "open",
-                "team": {"name": "БК Путилково"},
-                "competitor_team": {"name": "Соперник 1"},
-                "tournament": {"name": "Лига 1"},
-                "datetime": dt_24h
-            },
-            {
-                "id": 1002,
-                "status": "open",
-                "team": {"name": "Соперник 2"},
-                "competitor_team": {"name": "БК Путилково"},
-                "tournament": {"name": "Лига 1"},
-                "datetime": dt_3h
-            }
-        ]
-
-        cfg = {
-            "12345": {
-                "team": "БК Путилково",
-                "enabled": True,
-                "last_game_id": 1002,
-                "reminded_stages": ["1001:announced", "1002:announced"]
-            }
-        }
-        main.save_chats_config(cfg)
-
-        with patch("main.fetch_raw_abl_games", return_value=fake_games):
-            # Запускаем одну итерацию логики мониторинга (первый sleep(5) пропускаем, на втором прерываем)
-            with patch("main.time.sleep", side_effect=[None, InterruptedError]):
-                try:
-                    main.auto_monitor_loop()
-                except InterruptedError:
-                    pass
-
-        # Должно быть отправлено 2 напоминания: 24h для 1001 и 3h для 1002
-        self.assertEqual(mock_send.call_count, 2)
-
-        saved = main.load_chats_config()
-        stages = saved["12345"]["reminded_stages"]
-        self.assertTrue(any(k.startswith("1001:") and k.endswith(":24h") for k in stages))
-        self.assertTrue(any(k.startswith("1002:") and k.endswith(":3h") for k in stages))
-
-        # Повторный запуск мониторинга: НЕ должно быть повторных отправок (идемпотентность)!
-        mock_send.reset_mock()
-        with patch("main.fetch_raw_abl_games", return_value=fake_games):
-            with patch("main.time.sleep", side_effect=[None, InterruptedError]):
-                try:
-                    main.auto_monitor_loop()
-                except InterruptedError:
-                    pass
-
+    def test_monitor_loop_does_not_send_timed_reminders(self, mock_send, mock_poll):
+        main.save_chats_config({"12345": {
+            "team": "БК Путилково", "last_game_id": 1002,
+            "reminded_stages": ["1001:announced", "1001:poll", "1002:announced", "1002:poll"],
+        }})
+        with patch("main.fetch_raw_abl_games", return_value=[_game(1001, 24), _game(1002, 2)]), \
+             patch("main.time.sleep", side_effect=[None, InterruptedError]):
+            with self.assertRaises(InterruptedError):
+                main.auto_monitor_loop()
         mock_send.assert_not_called()
+        mock_poll.assert_not_called()
 
 
 def _game(gid, hours_from_now, team="БК Путилково", opp="Соперник"):
@@ -777,7 +727,7 @@ class TestReliability(unittest.TestCase):
         self.assertIsNone(main.send_msg("1", "x"))
         self.assertEqual(mock_post.call_count, main.SEND_ATTEMPTS)
 
-    # --- Отложенные напоминания ---
+    # --- Однократные уведомления о публикации расписания ---
 
     def _run_tick(self, games, send_ret=1):
         with patch("main.fetch_raw_abl_games", return_value=games), \
@@ -786,36 +736,29 @@ class TestReliability(unittest.TestCase):
             ok = main.monitor_tick()
         return ok, ms
 
-    def test_missed_24h_is_caught_up_after_downtime(self):
-        # Бот лежал, проснулся за 10 часов до игры — 24ч-напоминание всё равно должно прийти
-        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5, "reminded_stages": ["5:announced"]}})
-        ok, ms = self._run_tick([_game(5, 10)])
-        self.assertTrue(ok)
-        self.assertEqual(ms.call_count, 1)
-        self.assertIn("игра", ms.call_args[0][1])
+    def test_announced_game_stays_silent_as_start_approaches(self):
+        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5,
+                                      "reminded_stages": ["5:announced", "5:poll"]}})
+        game = _game(5, 48)
+        start = main.parse_game_dt(game)
+        with patch("main.fetch_raw_abl_games", return_value=[game]), \
+             patch("main.send_poll") as poll, patch("main.send_msg") as send:
+            for hours in (24, 10, 3, 1):
+                with self.subTest(hours=hours):
+                    self.assertTrue(main.monitor_tick(start - timedelta(hours=hours)))
+        send.assert_not_called()
+        poll.assert_not_called()
 
-    def test_3h_marks_24h_to_avoid_double_message(self):
-        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5, "reminded_stages": ["5:announced"]}})
-        games = [_game(5, 2)]
-        _, ms = self._run_tick(games)
-        self.assertEqual(ms.call_count, 1)
-        # Час спустя та же игра: ни 3ч, ни запоздалое 24ч повторно не отправляются
-        with patch("main.fetch_raw_abl_games", return_value=games), \
-             patch("main.send_poll", return_value=2), \
-             patch("main.send_msg", return_value=1) as ms2:
-            main.monitor_tick(datetime.now(timezone.utc) + timedelta(hours=1))
-        ms2.assert_not_called()
-
-    def test_rescheduled_game_gets_new_reminder(self):
-        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5, "reminded_stages": ["5:announced"]}})
-        self._run_tick([_game(5, 24)])
+    def test_rescheduled_game_is_not_announced_again(self):
+        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5,
+                                      "reminded_stages": ["5:announced", "5:poll"]}})
         _, ms = self._run_tick([_game(5, 24)])
         ms.assert_not_called()
-        _, ms = self._run_tick([_game(5, 20)])  # игру перенесли на 4 часа
-        self.assertEqual(ms.call_count, 1)
+        _, ms = self._run_tick([_game(5, 20)])
+        ms.assert_not_called()
 
     def test_failed_send_is_retried_next_tick(self):
-        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5, "reminded_stages": ["5:announced"]}})
+        main.save_chats_config({"1": {"team": "БК Путилково", "reminded_stages": []}})
         self._run_tick([_game(5, 24)], send_ret=None)
         _, ms = self._run_tick([_game(5, 24)])
         self.assertEqual(ms.call_count, 1)
@@ -831,25 +774,42 @@ class TestReliability(unittest.TestCase):
             main.save_chats_config({})  # /unset пришёл, пока шла рассылка
             return 1
         with patch("main.fetch_raw_abl_games", return_value=[_game(5, 24)]), \
-             patch("main.send_poll", return_value=2), \
+             patch("main.send_poll", return_value=2) as poll, \
              patch("main.send_msg", side_effect=send_and_unset):
             main.monitor_tick()
         self.assertEqual(main.load_chats_config(), {})
+        poll.assert_not_called()
 
-    def test_old_stages_are_pruned(self):
+    def test_temporarily_missing_or_undated_game_is_not_announced_again(self):
         main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5,
-                                      "reminded_stages": ["1:announced", "1:24h", "5:announced"]}})
+                                      "reminded_stages": ["1:announced", "1:poll", "5:announced", "5:poll"]}})
         self._run_tick([_game(5, 100)])
-        self.assertEqual(main.load_chats_config()["1"]["reminded_stages"], ["5:announced"])
+        undated = _game(1, 110)
+        undated["datetime"] = None
+        self._run_tick([undated, _game(5, 100)])
+        _, ms = self._run_tick([_game(1, 50), _game(5, 100)])
+        ms.assert_not_called()
+
+    def test_legacy_last_game_is_remembered_after_new_announcement(self):
+        main.save_chats_config({"1": {"team": "БК Путилково", "last_game_id": 5}})
+        games = [_game(6, 50), _game(5, 100)]
+        _, first_send = self._run_tick(games)
+        self.assertEqual(first_send.call_count, 1)
+        self.assertIn("5:announced", main.load_chats_config()["1"]["reminded_stages"])
+        _, next_send = self._run_tick(list(reversed(games)))
+        next_send.assert_not_called()
 
     @patch("main.send_msg", return_value=1)
-    def test_set_same_team_keeps_reminder_state(self, _):
-        main.save_chats_config({"7": {"team": "БК Путилково", "division": "", "last_game_id": 5,
-                                      "reminded_stages": ["5:announced"]}})
+    def test_set_same_team_keeps_announcement_state(self, _):
+        main.save_chats_config({"7": {"team": "БК Путилково", "division": "Старый дивизион", "last_game_id": 5,
+                                      "reminded_stages": ["5:announced"], "announcement_message_ids": {"5": 99}}})
         main.process_message({"text": "/set БК Путилково", "chat": {"id": 7, "type": "private"}, "from": {"id": 1}})
         self.assertEqual(main.load_chats_config()["7"]["reminded_stages"], ["5:announced"])
+        self.assertEqual(main.load_chats_config()["7"].get("announcement_message_ids"), {"5": 99})
+        self.assertNotIn("division", main.load_chats_config()["7"])
         main.process_message({"text": "/set Другая", "chat": {"id": 7, "type": "private"}, "from": {"id": 1}})
         self.assertEqual(main.load_chats_config()["7"]["reminded_stages"], [])
+        self.assertFalse(main.load_chats_config()["7"].get("announcement_message_ids"))
 
     def test_corrupt_config_without_backup_is_preserved(self):
         with open(main.CHATS_FILE, "w", encoding="utf-8") as f:
@@ -933,6 +893,64 @@ class TestPollFunctionality(unittest.TestCase):
         stages = cfg["100"]["reminded_stages"]
         self.assertIn("42:announced", stages)
         self.assertIn("42:poll", stages)
+
+        with patch("main.fetch_raw_abl_games", return_value=[game]):
+            main.monitor_tick()
+        self.assertEqual(mock_send.call_count, 1)
+        self.assertEqual(mock_poll.call_count, 1)
+
+    def test_all_new_games_are_announced_with_polls_on_first_tick(self):
+        main.save_chats_config({"100": {"team": "БК Путилково", "reminded_stages": []}})
+        games = [_game(42, 50, opp="Спартак"), _game(43, 100, opp="Метеор"),
+                 _game(44, 2, opp="ЦСКА")]
+        with patch("main.fetch_raw_abl_games", return_value=games), \
+             patch("main.send_msg", side_effect=[301, 302, 303]) as send, \
+             patch("main.send_poll", return_value=401) as poll:
+            main.monitor_tick()
+            self.assertEqual(send.call_count, 3)
+            self.assertTrue(all("Новое расписание матча" in call.args[1] for call in send.call_args_list))
+            self.assertEqual([call.kwargs["reply_to_message_id"] for call in poll.call_args_list],
+                             [301, 302, 303])
+            self.assertIn("ЦСКА", poll.call_args_list[0].args[1])
+            self.assertIn("Спартак", poll.call_args_list[1].args[1])
+            self.assertIn("Метеор", poll.call_args_list[2].args[1])
+            main.monitor_tick()
+            self.assertEqual(send.call_count, 3)
+            self.assertEqual(poll.call_count, 3)
+
+    def test_failed_poll_is_retried_using_persisted_announcement_id(self):
+        main.save_chats_config({"100": {"team": "БК Путилково", "reminded_stages": []}})
+        games = [_game(42, 50)]
+        with patch("main.fetch_raw_abl_games", return_value=games), \
+             patch("main.send_msg", return_value=777) as send, \
+             patch("main.send_poll", return_value=None):
+            main.monitor_tick()
+        send.assert_called_once()
+        saved = main.load_chats_config()
+        self.assertEqual(saved["100"].get("announcement_message_ids"), {"42": 777})
+        self.assertNotIn("42:poll", saved["100"]["reminded_stages"])
+
+        # Новый запуск получает только состояние с диска, включая id исходного поста.
+        with patch("main.fetch_raw_abl_games", return_value=games), \
+             patch("main.send_msg") as send_after_restart, \
+             patch("main.send_poll", return_value=888) as poll_after_restart:
+            main.monitor_tick()
+            main.monitor_tick()
+        send_after_restart.assert_not_called()
+        poll_after_restart.assert_called_once()
+        self.assertEqual(poll_after_restart.call_args.kwargs["reply_to_message_id"], 777)
+        self.assertIn("42:poll", main.load_chats_config()["100"]["reminded_stages"])
+
+    def test_legacy_announcement_can_get_missing_poll_without_new_post(self):
+        main.save_chats_config({"100": {"team": "БК Путилково",
+                                        "reminded_stages": ["42:announced"]}})
+        with patch("main.fetch_raw_abl_games", return_value=[_game(42, 50)]), \
+             patch("main.send_msg") as send, patch("main.send_poll", return_value=888) as poll:
+            main.monitor_tick()
+            main.monitor_tick()
+        send.assert_not_called()
+        poll.assert_called_once()
+        self.assertIsNone(poll.call_args.kwargs.get("reply_to_message_id"))
 
     @patch("main.send_poll", return_value=999)
     @patch("main.fetch_raw_abl_games")
