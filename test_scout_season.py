@@ -16,6 +16,7 @@ class TestScoutSeasonPlayers(unittest.TestCase):
         qualification["tournament_team_user"]["league_player"]["id"] = 777
         qualification["tournament_team_user"]["tournament_team"]["tournament_id"] = 4152
         regular = deepcopy(qualification)
+        qualification["tournament_team_user"]["active"] = False
         regular.update(games_count=2, points=30, rebounds=10, assists=4,
                        three_points_made=2, three_point_attempts=8, player_efficiency=20)
         regular["tournament_team_user"]["team_user"]["number"] = 0
@@ -32,6 +33,37 @@ class TestScoutSeasonPlayers(unittest.TestCase):
         self.assertEqual(p["totals"]["three_points_made"], 5)
         self.assertEqual(p["totals"]["three_point_attempts"], 18)
         self.assertTrue(p["label"].startswith("№0 "))
+
+    def test_deleted_player_is_absent_from_cards_and_top_five(self):
+        actual = player(0, "Настоящий", 4, 40)
+        deleted = player(47, "Михаил", 1, 5, 5, 6, 1, 5)
+        deleted["tournament_team_user"]["active"] = False
+        deleted["tournament_team_user"]["league_player"].update(id=27106, last_name="Василевич")
+        rows = [deleted, actual]
+        players = main._scout_players(self.team, self.season, rows)
+        self.assertEqual(len(players), 1)
+        self.assertIn("Настоящий", players[0]["label"])
+        text = main.format_scout_report(self.team, self.season, rows)
+        self.assertNotIn("Василевич", text)
+        self.assertNotIn("№47", text)
+        self.assertIn("Настоящий", text.split("ТОП-5", 1)[1])
+
+    def test_inactive_phase_still_counts_for_an_active_player_with_no_new_games(self):
+        previous = player(11, "Иван", 4, 40)
+        previous["tournament_team_user"]["active"] = False
+        previous["tournament_team_user"]["tournament_team"]["tournament_id"] = 4152
+        current = player(0, "Иван", 0, 0)
+        current["tournament_team_user"]["league_player"]["id"] = 11
+        players = main._scout_players(self.team, self.season, [previous, current])
+        self.assertEqual(len(players), 1)
+        self.assertEqual(players[0]["games"], 4)
+        self.assertEqual(players[0]["points"], 10)
+        self.assertTrue(players[0]["label"].startswith("№0 "))
+        # В API статистики новая заявка без матчей может вообще отсутствовать.
+        self.season["active_player_ids"] = {11}
+        players = main._scout_players(self.team, self.season, [previous])
+        self.assertEqual(len(players), 1)
+        self.assertEqual(players[0]["games"], 4)
 
     def test_same_name_and_number_do_not_merge_different_people(self):
         first = player(4, "Иван", 2, 20)

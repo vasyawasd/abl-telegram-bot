@@ -11,7 +11,7 @@ def player(number, name, games, points, rebounds=0, assists=0, made=0, attempts=
     return {"team_id": 4097, "games_count": games, "points": points,
             "rebounds": rebounds, "assists": assists, "steals": 0, "blocks": 0,
             "three_points_made": made, "three_point_attempts": attempts, "player_efficiency": points,
-            "tournament_team_user": {"league_player": {"id": number if number is not None else 999, "first_name": name, "last_name": "Игрок"},
+            "tournament_team_user": {"active": True, "league_player": {"id": number if number is not None else 999, "first_name": name, "last_name": "Игрок"},
                                      "team_user": {"number": number},
                                      "tournament_team": {"tournament_id": 4363}}}
 
@@ -29,8 +29,11 @@ class TestScout(unittest.TestCase):
         self.post = patch("main.http_post").start()
         self.post.return_value = self.response(self.rows)
         self.season = {"id": 231, "name": "Сезон 2026/27"}
-        self.memberships = [{"tournament": {**self.game["tournament"], "date": "2026-10-31", "season": self.season}}]
+        self.memberships = [{"id": 34234, "tournament": {**self.game["tournament"], "date": "2026-10-31", "season": self.season}}]
         def lookup(url, headers):
+            if "/users/" in url:
+                return [{"active": True, "league_player": {"id": 0}},
+                        {"active": True, "league_player": {"id": 4}}], {}
             if "tournament_seasons/" in url:
                 return [self.season], {}
             if "/teams/" in url:
@@ -68,6 +71,19 @@ class TestScout(unittest.TestCase):
         main.fetch_scout("БК Путилково")
         self.assertEqual(self.post.call_args.kwargs["json"]["team_id"], 4097)
 
+    def test_current_roster_keeps_real_player_without_new_phase_stats(self):
+        previous = player(0, "Действующий", 4, 40)
+        previous["tournament_team_user"]["active"] = False
+        previous["tournament_team_user"]["tournament_team"]["tournament_id"] = 4152
+        deleted = player(47, "Чужой", 1, 5)
+        deleted["tournament_team_user"]["active"] = False
+        self.post.return_value = self.response([previous, deleted])
+        text = main.fetch_scout("БК Путилково")
+        self.assertIn("Действующий", text)
+        self.assertNotIn("Чужой", text)
+        self.assertTrue(any("/tournament_team/34234/users/" in call.args[0]
+                            for call in self.lookup.call_args_list))
+
     def test_explicit_team_is_target_not_its_opponent(self):
         self.fetch.return_value = None  # Прямая команда работает и без общего расписания.
         text = main.fetch_scout("BOOMS", direct=True)
@@ -82,8 +98,8 @@ class TestScout(unittest.TestCase):
             ([self.season], {}),
             ([{"team": women, "name": "HDxSEVER", "tournament_id": 4000},
               {"team": men, "name": "HD X Север", "tournament_id": 4371}], {}),
-            ([{"tournament": {"id": 4152, "name": "Квалификация", "date": "2026-09-01"}},
-              {"tournament": {"id": 4371, "name": "PURE LOVE", "date": "2026-10-31"}}], {}),
+            ([{"id": 111, "tournament": {"id": 4152, "name": "Квалификация", "date": "2026-09-01"}},
+              {"id": 222, "tournament": {"id": 4371, "name": "PURE LOVE", "date": "2026-10-31"}}], {}),
         ]
         self.post.return_value = self.response([])
         text = main.fetch_scout("HDXSEVER", direct=True)

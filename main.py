@@ -585,6 +585,9 @@ def _scout_players(team: dict, season: dict, rows: list) -> list:
     """Объединяет турнирные записи одного игрока и считает взвешенные средние за сезон."""
     fields = ("points", "rebounds", "assists", "steals", "blocks",
               "three_points_made", "three_point_attempts", "player_efficiency")
+    active_ids = set(season.get("active_player_ids") or [])
+    active_ids.update(row["tournament_team_user"]["league_player"]["id"] for row in rows
+                      if row["tournament_team_user"].get("active") is not False)
     grouped = {}
     for row in rows:
         if row["team_id"] != team["id"]:
@@ -594,6 +597,8 @@ def _scout_players(team: dict, season: dict, rows: list) -> list:
         identity = person["id"]
         if identity is None:
             raise ValueError("Неизвестный игрок")
+        if identity not in active_ids:
+            continue
         games = int(row["games_count"])
         if games < 0 or games != float(row["games_count"]):
             raise ValueError("Некорректное число матчей")
@@ -686,7 +691,9 @@ def _scout_named_team(team_name: str) -> tuple | str:
     if not tournaments:
         return f"Для команды {team['name'][:100]} пока нет турнира в текущем сезоне."
     tournament = max(tournaments, key=lambda t: (t.get("date") or "", t["id"]))
-    return team, {**seasons[0], "current_tournament_id": tournament["id"]}
+    membership_id = next(row["id"] for row in memberships if row["tournament"]["id"] == tournament["id"])
+    return team, {**seasons[0], "current_tournament_id": tournament["id"],
+                  "current_tournament_team_id": membership_id}
 
 
 def _fetch_scout_statistics(team_id: int, season_id: int, group_by: str = "tournament_team_user") -> list:
@@ -753,10 +760,18 @@ def fetch_scout(team_name: str, direct: bool = False) -> str:
             memberships, _ = _fetch_abl_page(
                 f"https://mtgame.ru/api/v1/team/{int(team['id'])}/tournament_teams/",
                 {"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"})
-            selected = next(row["tournament"] for row in memberships if row["tournament"]["id"] == tournament["id"])
-            season = {**selected["season"], "current_tournament_id": tournament["id"]}
+            selected = next(row for row in memberships if row["tournament"]["id"] == tournament["id"])
+            season = {**selected["tournament"]["season"], "current_tournament_id": tournament["id"],
+                      "current_tournament_team_id": selected["id"]}
         team_id, season_id = int(team["id"]), int(season["id"])
         rows = _fetch_scout_statistics(team_id, season_id)
+        if rows:
+            roster, _ = _fetch_abl_page(
+                f"https://mtgame.ru/api/v1/tournament_team/{int(season['current_tournament_team_id'])}/users/",
+                {"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"})
+            # Текущий состав нужен и для игроков, ещё не сыгравших после перехода этапа.
+            season["active_player_ids"] = {member["league_player"]["id"] for member in roster
+                                           if member.get("active") is not False}
         attendance = _scout_attendance(team_id, season_id, rows)
         return format_scout_report(team, season, rows, dt, attendance)
     except (requests.RequestException, ValueError, TypeError, KeyError, AttributeError, OverflowError, StopIteration) as e:
