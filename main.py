@@ -632,7 +632,7 @@ def format_scout_report(team: dict, season: dict, rows: list, game_date=None, at
 
     season_name = str(season.get("name") or "ABL")[:100].removeprefix("Сезон ")
     header = [f"🔎 *Скаутинг: {str(team['name'])[:100]}*",
-              f"🏆 Сезон: {season_name}", "квалификация + основной турнир"]
+              f"🏆 Сезон: {season_name}"]
     if game_date:
         header.append(f"📅 Ближайшая игра: {game_date.astimezone(MOSCOW_TZ).strftime('%d.%m.%Y в %H:%M')} МСК")
     header.append(f"👥 Доезд: *{average(attendance['average'])}* игроков/матч · Матчей *{attendance['games']}*"

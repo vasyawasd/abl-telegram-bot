@@ -31,7 +31,7 @@ class TestScoutLayout(unittest.TestCase):
         header, cards = text.split("\n\n", 1)
         self.assertIn("BOOMS", header)
         self.assertIn("Сезон: Осень 2026", header)
-        self.assertIn("квалификация + основной турнир", header)
+        self.assertNotIn("квалификация", header)
         self.assertIn("15.11.2026 в 15:00", header)
         self.assertIn("Доезд: нет данных", header)
         self.assertIn("*№0 Игрок Первый*\nОчки *14,0* · Подборы *5,0*\n"
