@@ -10,8 +10,8 @@ import main
 def player(number, name, games, points, rebounds=0, assists=0, made=0, attempts=0):
     return {"team_id": 4097, "games_count": games, "points": points,
             "rebounds": rebounds, "assists": assists, "steals": 0, "blocks": 0,
-            "three_points_made": made, "three_point_attempts": attempts,
-            "tournament_team_user": {"league_player": {"first_name": name, "last_name": "Игрок"},
+            "three_points_made": made, "three_point_attempts": attempts, "player_efficiency": points,
+            "tournament_team_user": {"league_player": {"id": number if number is not None else 999, "first_name": name, "last_name": "Игрок"},
                                      "team_user": {"number": number},
                                      "tournament_team": {"tournament_id": 4363}}}
 
@@ -28,11 +28,15 @@ class TestScout(unittest.TestCase):
         self.fetch = patch("main.fetch_raw_abl_games", return_value=[self.game]).start()
         self.post = patch("main.http_post").start()
         self.post.return_value = self.response(self.rows)
-        self.lookup = patch("main._fetch_abl_page", side_effect=[
-            ([{"id": 231}], {}),
-            ([{"team": self.game["team"], "tournament_id": 4363}], {}),
-            ([{"tournament": {**self.game["tournament"], "date": "2026-10-31"}}], {}),
-        ]).start()
+        self.season = {"id": 231, "name": "Сезон 2026/27"}
+        self.memberships = [{"tournament": {**self.game["tournament"], "date": "2026-10-31", "season": self.season}}]
+        def lookup(url, headers):
+            if "tournament_seasons/" in url:
+                return [self.season], {}
+            if "/teams/" in url:
+                return [{"team": self.game["team"], "tournament_id": 4363}], {}
+            return self.memberships, {}
+        self.lookup = patch("main._fetch_abl_page", side_effect=lookup).start()
         self.addCleanup(patch.stopall)
 
     @staticmethod
@@ -45,17 +49,19 @@ class TestScout(unittest.TestCase):
         text = main.fetch_scout("БК Путилково")
         payload = self.post.call_args.kwargs["json"]
         self.assertEqual(payload["team_id"], 4097)
-        self.assertEqual(payload["tournament_ids"], "4363")
+        self.assertEqual(payload["tournament_season_ids"], "231")
+        self.assertNotIn("tournament_ids", payload)
         self.assertEqual(payload["per_game"], "0")
         self.assertEqual(payload["only_closed"], "1")
         self.assertIn("BOOMS", text)
-        self.assertIn("BASE", text)
+        self.assertIn("2026/27", text)
         self.assertIn("№0", text)
-        self.assertIn("20.0 оч", text)
-        self.assertIn("14.0 подб", text)
-        self.assertIn("3/12 (25%)", text)
+        self.assertIn("20,0", text)
+        self.assertIn("14,0", text)
+        self.assertIn("3/12", text)
+        self.assertIn("25%", text)
         self.assertLess(text.index("Вячеслав"), text.index("Андрей"))
-        self.assertIn("2 игр", text)
+        self.assertIn("Матчей", text)
 
     def test_home_team_also_gets_opponent(self):
         self.game["team"], self.game["competitor_team"] = self.game["competitor_team"], self.game["team"]
@@ -73,7 +79,7 @@ class TestScout(unittest.TestCase):
         men = {"id": 18417, "name": "HDXСЕВЕР"}
         women = {"id": 14352, "name": "HDxSEVER WOMEN"}
         self.lookup.side_effect = [
-            ([{"id": 231}], {}),
+            ([self.season], {}),
             ([{"team": women, "name": "HDxSEVER", "tournament_id": 4000},
               {"team": men, "name": "HD X Север", "tournament_id": 4371}], {}),
             ([{"tournament": {"id": 4152, "name": "Квалификация", "date": "2026-09-01"}},
@@ -82,8 +88,8 @@ class TestScout(unittest.TestCase):
         self.post.return_value = self.response([])
         text = main.fetch_scout("HDXSEVER", direct=True)
         payload = self.post.call_args.kwargs["json"]
-        self.assertEqual((payload["team_id"], payload["tournament_ids"]), (18417, "4371"))
-        self.assertIn("PURE LOVE", text)
+        self.assertEqual((payload["team_id"], payload["tournament_season_ids"]), (18417, "231"))
+        self.assertIn("2026/27", text)
 
     def test_ambiguous_direct_name_requests_more_precise_name(self):
         self.lookup.side_effect = [
@@ -113,11 +119,32 @@ class TestScout(unittest.TestCase):
         self.assertNotIn("nan", text)
 
     def test_pagination_reads_all_rows(self):
-        self.post.side_effect = [self.response(self.rows[:1], 2), self.response(self.rows[1:], 2)]
+        self.post.side_effect = [self.response(self.rows[:1], 2), self.response(self.rows[1:], 2),
+                                 self.response([{"team_id": 4097, "games_count": 3}])]
         text = main.fetch_scout("БК Путилково")
         self.assertIn("Андрей", text)
         self.assertIn("Вячеслав", text)
-        self.assertEqual([call.kwargs["json"]["page"] for call in self.post.call_args_list], [1, 2])
+        self.assertEqual([call.kwargs["json"]["page"] for call in self.post.call_args_list], [1, 2, 1])
+
+    def test_attendance_is_season_appearances_divided_by_team_games(self):
+        # Два игрока сыграли 3 и 2 матча; команда сыграла 4: среднее 5/4=1,25.
+        self.post.side_effect = [self.response(self.rows),
+                                 self.response([{"team_id": 4097, "games_count": 4}])]
+        text = main.fetch_scout("БК Путилково")
+        self.assertIn("Доезд: *1,2*", text)
+        self.assertIn("Матчей *4*", text)
+        team_payload = self.post.call_args.kwargs["json"]
+        self.assertEqual(team_payload["group_by"], "team")
+        self.assertEqual(team_payload["tournament_season_ids"], "231")
+        self.assertEqual(team_payload["only_closed"], "1")
+
+    def test_attendance_failure_does_not_hide_available_player_stats(self):
+        import requests
+        self.post.side_effect = [self.response(self.rows), requests.ConnectionError("down")]
+        text = main.fetch_scout("БК Путилково")
+        self.assertIn("Доезд: нет данных", text)
+        self.assertIn("Вячеслав", text)
+        self.assertIn("ТОП-5", text)
 
     def test_bad_or_foreign_stats_are_not_reported_as_our_team(self):
         for data in ({"error": "unavailable"}, [dict(self.rows[0], team_id=999)],

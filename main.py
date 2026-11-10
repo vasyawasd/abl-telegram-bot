@@ -581,49 +581,82 @@ def fetch_schedule(team_name: str, division_name: str = "") -> str:
 
     return "\n".join(lines)
 
-def format_scout_report(team: dict, tournament: dict, rows: list, game_date=None) -> str:
-    """Показатели за завершённые матчи выбранного турнира, а не за карьеру."""
-    players = []
-    fields = ("points", "rebounds", "assists", "steals", "blocks", "three_points_made", "three_point_attempts")
+def _scout_players(team: dict, season: dict, rows: list) -> list:
+    """Объединяет турнирные записи одного игрока и считает взвешенные средние за сезон."""
+    fields = ("points", "rebounds", "assists", "steals", "blocks",
+              "three_points_made", "three_point_attempts", "player_efficiency")
+    grouped = {}
     for row in rows:
+        if row["team_id"] != team["id"]:
+            raise ValueError("Статистика другой команды")
         member = row["tournament_team_user"]
-        if row["team_id"] != team["id"] or member["tournament_team"]["tournament_id"] != tournament["id"]:
-            raise ValueError("Статистика другой команды или турнира")
+        person = member["league_player"]
+        identity = person["id"]
+        if identity is None:
+            raise ValueError("Неизвестный игрок")
         games = int(row["games_count"])
-        if games <= 0:
-            continue
+        if games < 0 or games != float(row["games_count"]):
+            raise ValueError("Некорректное число матчей")
         totals = {key: float(row[key]) for key in fields}
-        if any(not math.isfinite(value) or value < 0 for value in totals.values()):
+        if any(not math.isfinite(value) or (value < 0 and key != "player_efficiency")
+               for key, value in totals.items()):
             raise ValueError("Некорректные показатели игрока")
-        person = member.get("league_player") or {}
-        name = " ".join(str(person.get(key) or "") for key in ("last_name", "first_name")).strip()[:60] or "Игрок"
-        number = (member.get("team_user") or {}).get("number")
-        label = f"№{str(number)[:8] if number is not None else '?'} {name}"
-        players.append({"label": label, "games": games, "totals": totals,
-                        **{key: value / games for key, value in totals.items()}})
+        p = grouped.setdefault(identity, {"games": 0, "totals": dict.fromkeys(fields, 0.0), "priority": (-1, -1)})
+        p["games"] += games
+        for key, value in totals.items():
+            p["totals"][key] += value
+        tournament_id = member["tournament_team"]["tournament_id"]
+        priority = (int(tournament_id == season["current_tournament_id"]), int(tournament_id))
+        if priority > p["priority"]:
+            name = " ".join(str(person.get(key) or "") for key in ("last_name", "first_name")).strip()[:60] or "Игрок"
+            number = (member.get("team_user") or {}).get("number")
+            p["label"] = f"№{str(number)[:8] if number is not None else '?'} {name}"
+            p["priority"] = priority
+    players = []
+    for p in grouped.values():
+        if not all(math.isfinite(value) for value in p["totals"].values()):
+            raise ValueError("Некорректная сумма показателей")
+        if p["games"]:
+            p.update({key: value / p["games"] for key, value in p["totals"].items()})
+            players.append(p)
+    return players
 
-    lines = [f"🔎 *Скаутинг: {str(team['name'])[:100]}*",
-             f"🏆 Турнир: {str(tournament.get('name') or 'ABL')[:100]}"]
+
+def format_scout_report(team: dict, season: dict, rows: list, game_date=None, attendance=None) -> str:
+    """Короткие карточки за весь сезон и общий рейтинг по среднему КП."""
+    players = sorted(_scout_players(team, season, rows),
+                     key=lambda p: (-p["points"], -p["games"], p["label"]))
+
+    def average(value):
+        return f"{value:.1f}".replace(".", ",")
+
+    season_name = str(season.get("name") or "ABL")[:100].removeprefix("Сезон ")
+    header = [f"🔎 *Скаутинг: {str(team['name'])[:100]}*",
+              f"🏆 Сезон: {season_name}", "квалификация + основной турнир"]
     if game_date:
-        lines.append(f"📅 Ближайшая игра: {game_date.astimezone(MOSCOW_TZ).strftime('%d.%m.%Y в %H:%M')} МСК")
+        header.append(f"📅 Ближайшая игра: {game_date.astimezone(MOSCOW_TZ).strftime('%d.%m.%Y в %H:%M')} МСК")
+    header.append(f"👥 Доезд: *{average(attendance['average'])}* игроков/матч · Матчей *{attendance['games']}*"
+                  if attendance else "👥 Доезд: нет данных")
+    paragraphs = ["\n".join(header)]
     if not players:
-        return "\n".join(lines) + "\n\nПока нет индивидуальной статистики завершённых матчей этого турнира."
+        return "\n\n".join(paragraphs + ["Пока нет индивидуальной статистики завершённых матчей этого сезона."])
 
-    players.sort(key=lambda p: (-p["points"], -p["games"], p["label"]))
-    lines.append("\n*Игроки по очкам за матч (до 8):*\nОчки, подборы, передачи — в среднем; 3-очковые — всего.")
     for p in players[:8]:
         made, attempts = p["totals"]["three_points_made"], p["totals"]["three_point_attempts"]
-        shots = f"{made:g}/{attempts:g} ({made / attempts:.0%})" if attempts else "нет попыток"
-        lines.append(f"• {p['label']} — {p['points']:.1f} оч · {p['rebounds']:.1f} подб · {p['assists']:.1f} пас ({p['games']} игр.)\n"
-                     f"  3-очк: {shots}; перехв {p['steals']:.1f} · блок {p['blocks']:.1f}")
-    lines.append("\n*Акценты по статистике:*")
-    for field, title in (("rebounds", "Подборы"), ("assists", "Передачи"), ("three_points_made", "Попадания из-за дуги")):
-        leader = max(players, key=lambda p: p[field])
-        if leader[field] > 0:
-            lines.append(f"• {title}: {leader['label']} — {leader[field]:.1f} за матч.")
+        shots = f"{made:g}/{attempts:g} · {made / attempts:.0%}" if attempts else "нет попыток"
+        paragraphs.append(f"*{p['label']}*\n"
+                          f"Очки *{average(p['points'])}* · Подборы *{average(p['rebounds'])}*\n"
+                          f"Передачи *{average(p['assists'])}* · Перехваты *{average(p['steals'])}*\n"
+                          f"Блоки *{average(p['blocks'])}* · Матчей *{p['games']}*\n"
+                          f"🎯 3-очковые: {shots}")
     if max(p["games"] for p in players) < 3:
-        lines.append("\nМало данных: у игроков меньше 3 матчей в этом турнире.")
-    return "\n".join(lines)
+        paragraphs.append("Мало данных: у игроков меньше 3 матчей в этом сезоне.")
+    paragraphs.append("*ТОП-5 игроков по КП*")
+    for rank, p in enumerate(sorted(players, key=lambda p: -p["player_efficiency"])[:5], 1):
+        paragraphs.append(f"{rank}. *{p['label']}*\n"
+                          f"Очки *{average(p['points'])}* · Подборы *{average(p['rebounds'])}*\n"
+                          f"Передачи *{average(p['assists'])}* · КП *{average(p['player_efficiency'])}*")
+    return "\n\n".join(paragraphs)
 
 
 def _scout_named_team(team_name: str) -> tuple | str:
@@ -653,7 +686,47 @@ def _scout_named_team(team_name: str) -> tuple | str:
     if not tournaments:
         return f"Для команды {team['name'][:100]} пока нет турнира в текущем сезоне."
     tournament = max(tournaments, key=lambda t: (t.get("date") or "", t["id"]))
-    return team, tournament
+    return team, {**seasons[0], "current_tournament_id": tournament["id"]}
+
+
+def _fetch_scout_statistics(team_id: int, season_id: int, group_by: str = "tournament_team_user") -> list:
+    rows = []
+    # ponytail: 1000 строк с запасом для сезонного состава; при обрыве не выдаём частичный итог.
+    for page in range(1, 11):
+        response = http_post("https://mtgame.ru/api/v1/basketball_statistic/",
+                             json={"group_by": group_by, "tournament_season_ids": str(season_id),
+                                   "team_id": team_id, "per_game": "0", "only_closed": "1", "page": page, "size": 100},
+                             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"},
+                             timeout=ABL_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, list):
+            raise ValueError("Неожиданный формат статистики")
+        rows.extend(data)
+        total = int(response.headers.get("X-Page-Count", len(rows)))
+        if len(rows) >= total:
+            return rows
+        if not data:
+            raise ValueError("Неполная статистика")
+    raise ValueError("Слишком много страниц статистики")
+
+
+def _scout_attendance(team_id: int, season_id: int, rows: list) -> dict | None:
+    if not rows:
+        return None
+    try:
+        teams = _fetch_scout_statistics(team_id, season_id, group_by="team")
+        if len(teams) != 1 or teams[0]["team_id"] != team_id:
+            raise ValueError("Неизвестная команда в статистике доезда")
+        games = int(teams[0]["games_count"])
+        counts = [int(row["games_count"]) for row in rows]
+        if games <= 0 or any(count < 0 or count > games for count in counts):
+            return None
+        return {"average": sum(counts) / games, "games": games}
+    except (requests.RequestException, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        # Доступные данные игроков остаются полезны и при сбое командной статистики.
+        safe_print("⚠️ Не удалось получить средний доезд ABL")
+        return None
 
 
 def fetch_scout(team_name: str, direct: bool = False) -> str:
@@ -666,7 +739,7 @@ def fetch_scout(team_name: str, direct: bool = False) -> str:
             target = _scout_named_team(team_name)
             if isinstance(target, str):
                 return target
-            team, tournament = target
+            team, season = target
         else:
             raw = fetch_raw_abl_games()
             if raw is None:
@@ -677,29 +750,16 @@ def fetch_scout(team_name: str, direct: bool = False) -> str:
             dt, game, is_left, _, _ = upcoming[0]
             team = game.get("competitor_team" if is_left else "team") or {}
             tournament = game.get("tournament") or {}
-        team_id, tournament_id = int(team["id"]), int(tournament["id"])
-        rows = []
-        # ponytail: 1000 строк с запасом для состава; не выдаём обрезанный отчёт при сбое пагинации.
-        for page in range(1, 11):
-            response = http_post("https://mtgame.ru/api/v1/basketball_statistic/",
-                                 json={"group_by": "tournament_team_user", "tournament_ids": str(tournament_id),
-                                       "team_id": team_id, "per_game": "0", "only_closed": "1", "page": page, "size": 100},
-                                 headers={"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"},
-                                 timeout=ABL_TIMEOUT)
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, list):
-                raise ValueError("Неожиданный формат статистики")
-            rows.extend(data)
-            total = int(response.headers.get("X-Page-Count", len(rows)))
-            if len(rows) >= total:
-                break
-            if not data:
-                raise ValueError("Неполная статистика")
-        else:
-            raise ValueError("Слишком много страниц статистики")
-        return format_scout_report(team, tournament, rows, dt)
-    except (requests.RequestException, ValueError, TypeError, KeyError, AttributeError, OverflowError) as e:
+            memberships, _ = _fetch_abl_page(
+                f"https://mtgame.ru/api/v1/team/{int(team['id'])}/tournament_teams/",
+                {"User-Agent": "Mozilla/5.0", "Referer": "https://ablforpeople.com/"})
+            selected = next(row["tournament"] for row in memberships if row["tournament"]["id"] == tournament["id"])
+            season = {**selected["season"], "current_tournament_id": tournament["id"]}
+        team_id, season_id = int(team["id"]), int(season["id"])
+        rows = _fetch_scout_statistics(team_id, season_id)
+        attendance = _scout_attendance(team_id, season_id, rows)
+        return format_scout_report(team, season, rows, dt, attendance)
+    except (requests.RequestException, ValueError, TypeError, KeyError, AttributeError, OverflowError, StopIteration) as e:
         safe_print(f"⚠️ Ошибка получения статистики ABL: {e}")
         return "⚠️ Не удалось получить статистику ABL. Попробуйте позже."
 
