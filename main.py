@@ -29,14 +29,18 @@ def safe_print(*args, **kwargs):
     args = (datetime.now().strftime("[%Y-%m-%d %H:%M:%S]"),) + args
     kwargs.setdefault("flush", True)
     try:
-        print(*args, **kwargs)
-    except Exception:
+        # Сетевые ошибки могут содержать адрес Telegram API целиком, вместе с токеном.
+        token = globals().get("TOKEN")
+        if token:
+            args = tuple(str(arg).replace(token, "[скрыто]") for arg in args)
         try:
+            print(*args, **kwargs)
+        except UnicodeError:
             enc = getattr(sys.stdout, "encoding", "utf-8") or "utf-8"
             cleaned = [str(a).encode(enc, errors="replace").decode(enc, errors="replace") for a in args]
             print(*cleaned, **kwargs)
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
@@ -1342,7 +1346,7 @@ def run_bot():
     if not TOKEN:
         safe_print("❌ ОШИБКА: Токен бота не найден! Проверьте файл .env")
         return
-    safe_print(f"Бот запущен (токен: {TOKEN[:10]}***, длина {len(TOKEN)} симв.)...")
+    safe_print("Бот запущен")
     threading.Thread(target=start_render_web_server, daemon=True).start()
     threading.Thread(target=auto_monitor_loop, name="monitor", daemon=True).start()
 

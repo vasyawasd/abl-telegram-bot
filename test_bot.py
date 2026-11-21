@@ -12,6 +12,18 @@ def reset_abl_cache():
     main.ABL_GAMES_CACHE_TIME = 0.0
 
 class TestAblBot(unittest.TestCase):
+    def test_log_hides_telegram_token_in_network_exception(self):
+        from io import StringIO
+
+        output = StringIO()
+        token = "123456789:synthetic-test-secret"
+        error = ConnectionError(f"/bot{token}/getUpdates: Failed to resolve 'api.telegram.org'")
+        with patch.object(main, "TOKEN", token):
+            main.safe_print("Сбой сети:", error, file=output)
+
+        self.assertNotIn(token, output.getvalue())
+        self.assertIn("/getUpdates: Failed to resolve 'api.telegram.org'", output.getvalue())
+
     def setUp(self):
         reset_abl_cache()
         self.mock_config = {}
