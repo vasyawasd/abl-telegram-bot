@@ -151,7 +151,7 @@ except Exception as e:
 # Повтор по 5xx / обрыву чтения — только для GET, чтобы не задублировать sendMessage.
 _HTTP_LOCAL = threading.local()
 
-def _make_session() -> requests.Session:
+def _make_session(retry_requests: bool = True) -> requests.Session:
     s = requests.Session()
     retry = Retry(
         total=4, connect=4, read=2, status=3,
@@ -161,19 +161,21 @@ def _make_session() -> requests.Session:
         respect_retry_after_header=False,  # 429 обрабатываем сами
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
+    adapter = HTTPAdapter(max_retries=retry if retry_requests else 0, pool_connections=4, pool_maxsize=8)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
 
-def _session() -> requests.Session:
-    s = getattr(_HTTP_LOCAL, "session", None)
+def _session(retry_requests: bool = True) -> requests.Session:
+    key = "session" if retry_requests else "single_attempt_session"
+    s = getattr(_HTTP_LOCAL, key, None)
     if s is None:
-        s = _HTTP_LOCAL.session = _make_session()
+        s = _make_session(retry_requests)
+        setattr(_HTTP_LOCAL, key, s)
     return s
 
-def http_get(url: str, **kwargs) -> requests.Response:
-    return _session().get(url, **kwargs)
+def http_get(url: str, *, retry_requests: bool = True, **kwargs) -> requests.Response:
+    return _session(retry_requests).get(url, **kwargs)
 
 def http_post(url: str, **kwargs) -> requests.Response:
     return _session().post(url, **kwargs)
@@ -359,7 +361,8 @@ def _fetch_abl_page(url: str, headers: dict) -> tuple:
         if threading.current_thread().name == "monitor":
             touch_heartbeat(MONITOR_HEARTBEAT_FILE)
         try:
-            r = http_get(url, headers=headers, timeout=ABL_TIMEOUT)
+            # ponytail: повторами уже управляет этот цикл.
+            r = http_get(url, headers=headers, timeout=ABL_TIMEOUT, retry_requests=False)
             if r.status_code != 200:
                 raise ValueError(f"HTTP {r.status_code}")
             data = r.json()

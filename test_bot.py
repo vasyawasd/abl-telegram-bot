@@ -685,6 +685,15 @@ class TestReliability(unittest.TestCase):
 
     # --- ABL API: повторы и кэш ---
 
+    def test_abl_connection_failure_uses_one_retry_budget(self):
+        from urllib3.exceptions import NewConnectionError
+
+        with patch("main._HTTP_LOCAL", main.threading.local()), \
+             patch("urllib3.connection.HTTPSConnection._new_conn",
+                   side_effect=NewConnectionError(None, "сеть недоступна")) as connect:
+            self.assertIsNone(main.fetch_raw_abl_games())
+        self.assertEqual(connect.call_count, main.ABL_ATTEMPTS)
+
     @patch("main.http_get")
     def test_abl_retries_transient_errors(self, mock_get):
         import requests
